@@ -5,6 +5,7 @@ const dotenv = require('dotenv');
 const axios = require('axios');
 dotenv.config();
 
+
 const salesRoutes = require('./routes/sales');
 const itemsRoutes = require('./routes/items');
 const stockRoutes = require('./routes/stock');
@@ -22,20 +23,10 @@ const suppliersRoutes = require('./routes/suppliers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS - Allow both local and production
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'https://teemoreg.github.io',
-  'https://evopay-vscu-frontend.vercel.app',
-  process.env.FRONTEND_URL
-].filter(Boolean);
-
 app.use(cors({
-  origin: allowedOrigins,
+  origin: ['http://localhost:5173', 'http://localhost:3000'],
   credentials: true,
 }));
-
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -58,8 +49,6 @@ app.get('/api/health', (req, res) => {
     status: 'ok', 
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    database: process.env.NODE_ENV === 'production' ? 'Supabase' : 'SQLite'
   });
 });
 
@@ -131,11 +120,10 @@ app.post('/api/initializer/selectInitInfo', async (req, res) => {
 // ============================================
 // SYNC PROCESSING
 // ============================================
-const { connectDB, query, run } = require('./db');
+const db = require('./db');
 const vscuClient = require('./services/vscuClient');
 
 let isAutoSyncing = false;
-let db;
 
 async function processManualSync() {
   if (isAutoSyncing) return;
@@ -148,8 +136,7 @@ async function processManualSync() {
       return { synced: 0, failed: 0, message: 'VSCU offline' };
     }
 
-    // Use query() instead of db.allAsync
-    const pending = await query(
+    const pending = await db.allAsync(
       `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 50`
     );
 
@@ -183,7 +170,7 @@ async function processManualSync() {
         } else if (item.endpoint === '/branches/saveBrancheUsers') {
           response = await vscuClient.saveBranchUser(payload);
         } else {
-          await run(
+          await db.runAsync(
             `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
             ['Unknown endpoint: ' + item.endpoint, item.id]
           );
@@ -192,12 +179,12 @@ async function processManualSync() {
         }
 
         if (response && (response.resultCd === '000' || response.resultCd === '00')) {
-          await run(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
+          await db.runAsync(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
           synced++;
           console.log(`Synced item ${item.id} (${item.endpoint})`);
         } else {
           const errorMsg = response?.resultMsg || response?.message || 'Unknown error';
-          await run(
+          await db.runAsync(
             `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
             [errorMsg, item.id]
           );
@@ -205,7 +192,7 @@ async function processManualSync() {
         }
       } catch (itemError) {
         console.error('Manual sync item error:', itemError.message);
-        await run(
+        await db.runAsync(
           `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
           [itemError.message, item.id]
         );
@@ -214,6 +201,7 @@ async function processManualSync() {
     }
 
     console.log(`Manual sync: ${synced} synced, ${failed} failed`);
+
     return { synced, failed, message: `Synced ${synced}, failed ${failed}` };
 
   } catch (error) {
@@ -229,13 +217,12 @@ app._manualSync = processManualSync;
 // ============================================
 // START SERVER WITH DATABASE CONNECTION
 // ============================================
-connectDB().then((dbInstance) => {
-  db = dbInstance;
+const { connectDB } = require('./db');
+
+connectDB().then(() => {
   const server = app.listen(PORT, () => {
     console.log(`Backend running on http://localhost:${PORT}`);
     console.log(`API ready at http://localhost:${PORT}/api`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Database: ${process.env.NODE_ENV === 'production' ? 'Supabase' : 'SQLite'}`);
   });
 
   process.on('SIGTERM', () => {
