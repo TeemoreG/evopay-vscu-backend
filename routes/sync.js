@@ -21,10 +21,35 @@ async function getPendingCount(page) {
   return result?.count || 0;
 }
 
+// Helper: Check if item already exists in queue
+async function isItemInQueue(endpoint, identifier, value) {
+  let sql = '';
+  let params = [];
+
+  if (endpoint === '/items/saveItems') {
+    sql = `SELECT COUNT(*) as count FROM sync_queue WHERE endpoint = ? AND json_extract(payload, '$.itemCd') = ? AND status = 'pending'`;
+    params = [endpoint, value];
+  } else if (endpoint === '/trnsSales/saveSales') {
+    sql = `SELECT COUNT(*) as count FROM sync_queue WHERE endpoint = ? AND json_extract(payload, '$.invcNo') = ? AND status = 'pending'`;
+    params = [endpoint, parseInt(value)];
+  } else if (endpoint === '/purchases/savePurchases') {
+    sql = `SELECT COUNT(*) as count FROM sync_queue WHERE endpoint = ? AND json_extract(payload, '$.invcNo') = ? AND status = 'pending'`;
+    params = [endpoint, parseInt(value)];
+  } else if (endpoint === '/stock/saveStockItems') {
+    sql = `SELECT COUNT(*) as count FROM sync_queue WHERE endpoint = ? AND json_extract(payload, '$.sarNo') = ? AND status = 'pending'`;
+    params = [endpoint, parseInt(value)];
+  } else {
+    return false;
+  }
+
+  const result = await db.getAsync(sql, params);
+  return result?.count > 0;
+}
+
 // Helper: Process sync queue
 async function processSyncQueue() {
   const queue = await db.allAsync(
-    `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 50`
+    `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY retry_count ASC, created_at ASC LIMIT 50`
   );
 
   if (queue.length === 0) {
@@ -33,51 +58,81 @@ async function processSyncQueue() {
 
   let synced = 0;
   let failed = 0;
+  const errors = [];
 
   for (const item of queue) {
     const now = new Date().toISOString();
     try {
       const payload = JSON.parse(item.payload);
       let response = null;
+      let success = false;
 
-      if (item.endpoint === '/trnsSales/saveSales') {
-        response = await vscuClient.sendSale(payload);
-      } else if (item.endpoint === '/items/saveItems') {
-        response = await vscuClient.saveItem(payload);
-      } else if (item.endpoint === '/items/saveItemComposition') {
-        response = await vscuClient.sendComposition(payload);
-      } else if (item.endpoint === '/stock/saveStockItems') {
-        response = await vscuClient.saveStock(payload);
-      } else if (item.endpoint === '/purchases/savePurchases') {
-        response = await vscuClient.savePurchase(payload);
-      } else if (item.endpoint === '/branches/saveBrancheCustomers') {
-        response = await vscuClient.saveBranchCustomer(payload);
-      } else if (item.endpoint === '/branches/saveBrancheUsers') {
-        response = await vscuClient.saveBranchUser(payload);
+      // Route to appropriate VSCU endpoint
+      switch (item.endpoint) {
+        case '/trnsSales/saveSales':
+          response = await vscuClient.sendSale(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        case '/items/saveItems':
+          response = await vscuClient.saveItem(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        case '/items/saveItemComposition':
+          response = await vscuClient.sendComposition(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        case '/stock/saveStockItems':
+          response = await vscuClient.saveStock(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        case '/purchases/savePurchases':
+          response = await vscuClient.savePurchase(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        case '/branches/saveBrancheCustomers':
+          response = await vscuClient.saveBranchCustomer(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        case '/branches/saveBrancheUsers':
+          response = await vscuClient.saveBranchUser(payload);
+          success = response && (response.resultCd === '000' || response.resultCd === '00');
+          break;
+        default:
+          await db.runAsync(
+            `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = ? WHERE id = ?`,
+            ['Unknown endpoint: ' + item.endpoint, now, item.id]
+          );
+          failed++;
+          errors.push({ id: item.id, endpoint: item.endpoint, error: 'Unknown endpoint' });
+          continue;
       }
 
-      if (response && (response.resultCd === '000' || response.resultCd === '00')) {
+      if (success) {
         await db.runAsync(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
         synced++;
+        console.log(`✅ Synced item ${item.id} (${item.endpoint})`);
       } else {
-        const errorMsg = response?.resultMsg || response?.message || 'Unknown error';
+        const errorMsg = response?.resultMsg || response?.message || 'VSCU error';
         await db.runAsync(
           `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = ? WHERE id = ?`,
           [errorMsg, now, item.id]
         );
         failed++;
+        errors.push({ id: item.id, endpoint: item.endpoint, error: errorMsg });
+        console.log(`❌ Failed to sync item ${item.id}: ${errorMsg}`);
       }
     } catch (itemError) {
-      console.error('Error processing sync item:', itemError);
+      console.error('Error processing sync item:', itemError.message);
       await db.runAsync(
         `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = ? WHERE id = ?`,
         [itemError.message, now, item.id]
       );
       failed++;
+      errors.push({ id: item.id, error: itemError.message });
     }
   }
 
-  return { synced, failed };
+  return { synced, failed, errors };
 }
 
 // Process sync queue - send pending items to VSCU
@@ -86,93 +141,32 @@ router.post('/process', async (req, res) => {
     // Check if VSCU is online first
     const isOnline = await vscuClient.checkStatus();
     
-    if (!isOnline) {
+    if (!isOnline || !isOnline.connected) {
       return res.json({
         success: false,
         message: 'VSCU is offline. Items will sync later.',
-        pending: await getPendingCount()
+        pending: await getPendingCount(),
+        synced: 0,
+        failed: 0
       });
     }
 
     const queue = await db.allAsync(
-      `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 50`
+      `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY retry_count ASC, created_at ASC LIMIT 50`
     );
 
     if (queue.length === 0) {
       return res.json({ success: true, synced: 0, failed: 0, message: 'No items to sync' });
     }
 
-    let synced = 0;
-    let failed = 0;
-    const errors = [];
-
-    for (const item of queue) {
-      const now = new Date().toISOString();
-      try {
-        const payload = JSON.parse(item.payload);
-        let response = null;
-
-        // Route to appropriate VSCU endpoint based on the stored endpoint
-        if (item.endpoint === '/trnsSales/saveSales') {
-          response = await vscuClient.sendSale(payload);
-        } else if (item.endpoint === '/items/saveItems') {
-          response = await vscuClient.saveItem(payload);
-        } else if (item.endpoint === '/items/saveItemComposition') {
-          response = await vscuClient.sendComposition(payload);
-        } else if (item.endpoint === '/stock/saveStockItems') {
-          response = await vscuClient.saveStock(payload);
-        } else if (item.endpoint === '/purchases/savePurchases') {
-          response = await vscuClient.savePurchase(payload);
-        } else if (item.endpoint === '/branches/saveBrancheCustomers') {
-          response = await vscuClient.saveBranchCustomer(payload);
-        } else if (item.endpoint === '/branches/saveBrancheUsers') {
-          response = await vscuClient.saveBranchUser(payload);
-        } else {
-          // Unknown endpoint - mark as failed
-          await db.runAsync(
-            `UPDATE sync_queue SET status = 'failed', error = ?, retry_count = retry_count + 1 WHERE id = ?`,
-            ['Unknown endpoint: ' + item.endpoint, item.id]
-          );
-          failed++;
-          continue;
-        }
-
-        // Check response - VSCU returns resultCd === '000' for success
-        if (response && (response.resultCd === '000' || response.resultCd === '00')) {
-          // Success - delete from queue
-          await db.runAsync(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
-          synced++;
-        } else {
-          // Failed - increment retry count
-          const errorMsg = response?.resultMsg || response?.message || 'Unknown error';
-          await db.runAsync(
-            `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = ? WHERE id = ?`,
-            [errorMsg, now, item.id]
-          );
-          failed++;
-          errors.push({ id: item.id, endpoint: item.endpoint, error: errorMsg });
-        }
-      } catch (itemError) {
-        console.error('Error processing sync item:', itemError);
-        await db.runAsync(
-          `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = ? WHERE id = ?`,
-          [itemError.message, now, item.id]
-        );
-        failed++;
-        errors.push({ id: item.id, error: itemError.message });
-      }
-    }
-
-    // Get remaining count
+    const result = await processSyncQueue();
     const remaining = await getPendingCount();
 
     res.json({
       success: true,
-      synced,
-      failed,
+      ...result,
       remaining,
-      errors: errors.length > 0 ? errors : undefined,
-      message: `Synced ${synced} items, ${failed} failed. ${remaining} remaining.`
+      message: `Synced ${result.synced} items, ${result.failed} failed. ${remaining} remaining.`
     });
   } catch (error) {
     console.error('Sync process error:', error);
@@ -180,12 +174,11 @@ router.post('/process', async (req, res) => {
   }
 });
 
-// Get sync queue status - UPDATED with page filter
+// Get sync queue status - with page filter
 router.get('/status', async (req, res) => {
   try {
     const { page } = req.query;
     
-    // Map page to endpoint filter
     let endpointFilter = '';
     if (page === 'items') endpointFilter = "AND endpoint = '/items/saveItems'";
     else if (page === 'stock') endpointFilter = "AND endpoint = '/stock/saveStockItems'";
@@ -201,12 +194,10 @@ router.get('/status', async (req, res) => {
     
     const total = await db.getAsync(`SELECT COUNT(*) as count FROM sync_queue`);
     
-    // Group by endpoint for this page
     const byEndpoint = await db.allAsync(
       `SELECT endpoint, COUNT(*) as count FROM sync_queue WHERE status = 'pending' ${endpointFilter} GROUP BY endpoint`
     );
     
-    // Get recent errors for this page
     const recentErrors = await db.allAsync(
       `SELECT id, endpoint, error, retry_count, created_at, last_attempt 
        FROM sync_queue 
@@ -221,6 +212,7 @@ router.get('/status', async (req, res) => {
       recentErrors: recentErrors || []
     });
   } catch (error) {
+    console.error('Sync status error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -237,28 +229,46 @@ router.post('/retry/:id', async (req, res) => {
     const payload = JSON.parse(item.payload);
     let response = null;
     const now = new Date().toISOString();
+    let success = false;
 
-    if (item.endpoint === '/trnsSales/saveSales') {
-      response = await vscuClient.sendSale(payload);
-    } else if (item.endpoint === '/items/saveItems') {
-      response = await vscuClient.saveItem(payload);
-    } else if (item.endpoint === '/items/saveItemComposition') {
-      response = await vscuClient.sendComposition(payload);
-    } else if (item.endpoint === '/stock/saveStockItems') {
-      response = await vscuClient.saveStock(payload);
-    } else if (item.endpoint === '/purchases/savePurchases') {
-      response = await vscuClient.savePurchase(payload);
-    } else if (item.endpoint === '/branches/saveBrancheCustomers') {
-      response = await vscuClient.saveBranchCustomer(payload);
-    } else if (item.endpoint === '/branches/saveBrancheUsers') {
-      response = await vscuClient.saveBranchUser(payload);
+    switch (item.endpoint) {
+      case '/trnsSales/saveSales':
+        response = await vscuClient.sendSale(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      case '/items/saveItems':
+        response = await vscuClient.saveItem(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      case '/items/saveItemComposition':
+        response = await vscuClient.sendComposition(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      case '/stock/saveStockItems':
+        response = await vscuClient.saveStock(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      case '/purchases/savePurchases':
+        response = await vscuClient.savePurchase(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      case '/branches/saveBrancheCustomers':
+        response = await vscuClient.saveBranchCustomer(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      case '/branches/saveBrancheUsers':
+        response = await vscuClient.saveBranchUser(payload);
+        success = response && (response.resultCd === '000' || response.resultCd === '00');
+        break;
+      default:
+        return res.status(400).json({ error: 'Unknown endpoint: ' + item.endpoint });
     }
 
-    if (response && (response.resultCd === '000' || response.resultCd === '00')) {
+    if (success) {
       await db.runAsync(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
       res.json({ success: true, synced: true });
     } else {
-      const errorMsg = response?.resultMsg || response?.message || 'Unknown error';
+      const errorMsg = response?.resultMsg || response?.message || 'VSCU error';
       await db.runAsync(
         `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = ? WHERE id = ?`,
         [errorMsg, now, item.id]
@@ -266,6 +276,7 @@ router.post('/retry/:id', async (req, res) => {
       res.json({ success: false, synced: false, error: errorMsg });
     }
   } catch (error) {
+    console.error('Retry error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -278,6 +289,7 @@ router.delete('/clear', async (req, res) => {
     );
     res.json({ success: true, deleted: result.changes || 0 });
   } catch (error) {
+    console.error('Clear failed error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -288,6 +300,7 @@ router.delete('/clear-all', async (req, res) => {
     const result = await db.runAsync(`DELETE FROM sync_queue`);
     res.json({ success: true, deleted: result.changes || 0 });
   } catch (error) {
+    console.error('Clear all error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -295,7 +308,6 @@ router.delete('/clear-all', async (req, res) => {
 // Auto-sync endpoint - called by frontend periodically
 router.post('/auto-sync', async (req, res) => {
   try {
-    // Check pending count first
     const pending = await getPendingCount();
     
     if (pending === 0) {
@@ -308,10 +320,9 @@ router.post('/auto-sync', async (req, res) => {
       });
     }
 
-    // Check if VSCU is online
     const isOnline = await vscuClient.checkStatus();
     
-    if (!isOnline) {
+    if (!isOnline || !isOnline.connected) {
       return res.json({ 
         success: false, 
         message: 'VSCU is offline. Items will sync later.',
@@ -321,9 +332,7 @@ router.post('/auto-sync', async (req, res) => {
       });
     }
 
-    // Process sync queue
     const result = await processSyncQueue();
-    
     const remaining = await getPendingCount();
     
     res.json({

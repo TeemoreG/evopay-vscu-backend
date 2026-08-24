@@ -51,7 +51,6 @@ setInterval(() => {
 // ===== HELPER: SEED DEFAULT KRA eTIMS PAYMENT TYPES =====
 const ensurePaymentTypesSeeded = async () => {
   try {
-    // Check if db is connected
     await db.runAsync('SELECT 1');
     
     await db.runAsync(`
@@ -85,10 +84,11 @@ const ensurePaymentTypesSeeded = async () => {
   }
 };
 
-// Seed payment types on file load (with error handling)
 ensurePaymentTypesSeeded();
 
-// ===== TAX RATES =====
+// ============================================
+// TAX RATES
+// ============================================
 router.get('/tax-rates', async (req, res) => {
   try {
     const rows = await db.allAsync(`SELECT * FROM tax_rates ORDER BY code`);
@@ -99,7 +99,80 @@ router.get('/tax-rates', async (req, res) => {
   }
 });
 
-// ===== PAYMENT TYPES =====
+router.post('/tax-rates', rateLimit, async (req, res) => {
+  try {
+    const { code, label, rate, description } = req.body;
+    if (!code || !label) {
+      return res.status(400).json({ error: 'Both code and label are required.' });
+    }
+
+    const now = new Date().toISOString();
+
+    await db.runAsync(
+      `INSERT OR REPLACE INTO tax_rates (code, label, rate, description, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [code, label, rate || 0, description || null, now]
+    );
+
+    res.json({ success: true, message: 'Tax rate saved successfully.' });
+  } catch (error) {
+    console.error('Tax rate save error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.delete('/tax-rates/:code', rateLimit, async (req, res) => {
+  try {
+    const { code } = req.params;
+    
+    await db.runAsync(
+      `DELETE FROM tax_rates WHERE code = ?`,
+      [code]
+    );
+    
+    res.json({ success: true, message: 'Tax rate deleted successfully.' });
+  } catch (error) {
+    console.error('Tax rate delete error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/tax-rates/bulk', async (req, res) => {
+  try {
+    const taxList = req.body;
+    
+    if (!Array.isArray(taxList) || taxList.length === 0) {
+      return res.status(400).json({ error: 'Tax rates array is required' });
+    }
+
+    const now = new Date().toISOString();
+    let saved = 0;
+
+    for (const rate of taxList) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO tax_rates (code, label, rate, description, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          rate.cd,
+          rate.cdNm,
+          parseFloat(rate.userDfnCd1) / 100 || 0,
+          rate.cdDesc || '',
+          now
+        ]
+      );
+      saved++;
+    }
+
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Bulk save tax rates error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// PAYMENT TYPES
+// ============================================
 router.get('/payment-types', async (req, res) => {
   try {
     const rows = await db.allAsync(
@@ -130,7 +203,7 @@ router.post('/payment-types', rateLimit, async (req, res) => {
       [code, label, is_active, description || null]
     );
 
-    res.json({ success: true, message: 'Payment type updated successfully.' });
+    res.json({ success: true, message: 'Payment type saved successfully.' });
   } catch (error) {
     console.error('Payment type save error:', error.message);
     res.status(500).json({ error: error.message });
@@ -159,7 +232,40 @@ router.delete('/payment-types/:code', rateLimit, async (req, res) => {
   }
 });
 
-// ===== UNIT CODES =====
+router.post('/payment-types/bulk', async (req, res) => {
+  try {
+    const paymentList = req.body;
+    
+    if (!Array.isArray(paymentList) || paymentList.length === 0) {
+      return res.status(400).json({ error: 'Payment types array is required' });
+    }
+
+    let saved = 0;
+
+    for (const type of paymentList) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO payment_types (code, label, description, is_active)
+         VALUES (?, ?, ?, ?)`,
+        [
+          type.cd,
+          type.cdNm,
+          type.cdDesc || '',
+          1
+        ]
+      );
+      saved++;
+    }
+
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Bulk save payment types error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// UNIT CODES
+// ============================================
 router.get('/unit-codes', async (req, res) => {
   try {
     const rows = await db.allAsync(`SELECT * FROM unit_codes ORDER BY code`);
@@ -193,7 +299,54 @@ router.post('/unit-codes', rateLimit, async (req, res) => {
   }
 });
 
-// ===== CLASSIFICATIONS =====
+router.delete('/unit-codes/:code', rateLimit, async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    await db.runAsync(
+      `DELETE FROM unit_codes WHERE code = ?`,
+      [code]
+    );
+    res.json({ success: true, message: 'Unit code deleted successfully.' });
+  } catch (error) {
+    console.error('Unit code delete error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/unit-codes/bulk', async (req, res) => {
+  try {
+    const unitList = req.body;
+    
+    if (!Array.isArray(unitList) || unitList.length === 0) {
+      return res.status(400).json({ error: 'Unit codes array is required' });
+    }
+
+    let saved = 0;
+
+    for (const unit of unitList) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO unit_codes (code, label, description)
+         VALUES (?, ?, ?)`,
+        [
+          unit.cd,
+          unit.cdNm,
+          unit.cdDesc || ''
+        ]
+      );
+      saved++;
+    }
+
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Bulk save unit codes error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// CLASSIFICATIONS
+// ============================================
 router.get('/classifications', async (req, res) => {
   try {
     const rows = await db.allAsync(`SELECT * FROM classifications ORDER BY code`);
@@ -206,7 +359,7 @@ router.get('/classifications', async (req, res) => {
 
 router.post('/classifications', rateLimit, async (req, res) => {
   try {
-    const { code, name, description } = req.body;
+    const { code, name, description, level } = req.body;
     if (!code || !name) {
       return res.status(400).json({ error: 'Both code and name are required.' });
     }
@@ -215,9 +368,12 @@ router.post('/classifications', rateLimit, async (req, res) => {
       return res.status(400).json({ error: 'Code must be exactly 8 digits.' });
     }
 
+    const now = new Date().toISOString();
+
     await db.runAsync(
-      `INSERT OR REPLACE INTO classifications (code, name, description) VALUES (?, ?, ?)`,
-      [code, name, description || null]
+      `INSERT OR REPLACE INTO classifications (code, name, description, level, use_yn, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [code, name, description || null, level || 1, 'Y', now]
     );
 
     res.json({ success: true, message: 'Classification saved successfully.' });
@@ -227,7 +383,58 @@ router.post('/classifications', rateLimit, async (req, res) => {
   }
 });
 
-// ===== SYSTEM SETTINGS =====
+router.delete('/classifications/:code', rateLimit, async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    await db.runAsync(
+      `DELETE FROM classifications WHERE code = ?`,
+      [code]
+    );
+    res.json({ success: true, message: 'Classification deleted successfully.' });
+  } catch (error) {
+    console.error('Classification delete error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/classifications/bulk', async (req, res) => {
+  try {
+    const classList = req.body;
+    
+    if (!Array.isArray(classList) || classList.length === 0) {
+      return res.status(400).json({ error: 'Classifications array is required' });
+    }
+
+    const now = new Date().toISOString();
+    let saved = 0;
+
+    for (const cls of classList) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO classifications (code, name, description, level, use_yn, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          cls.itemClsCd,
+          cls.itemClsNm,
+          cls.itemClsDesc || null,
+          cls.itemClsLvl || 1,
+          cls.useYn || 'Y',
+          now
+        ]
+      );
+      saved++;
+    }
+
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Bulk save classifications error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// SYSTEM SETTINGS
+// ============================================
 const VALID_SETTINGS_KEYS = [
   'company_name',
   'company_address',
@@ -353,23 +560,36 @@ router.post('/code/selectCodes', async (req, res) => {
   try {
     const { tin, bhfId, lastReqDt } = req.body;
     
+    console.log('⏳ Calling VSCU...');
+    
     const response = await axios.post(
       `${vscuClient.baseUrl}/code/selectCodes`,
       { tin, bhfId, lastReqDt },
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('📥 VSCU Response Code:', response.data?.resultCd);
+    console.log('📥 VSCU Response Msg:', response.data?.resultMsg);
+    console.log('📦 clsList length:', response.data?.data?.clsList?.length || 0);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch codes:', error.message);
+    console.error('❌ Failed to fetch codes:', error.message);
+    if (error.response) {
+      console.error('VSCU Error Status:', error.response.status);
+      console.error('VSCU Error Data:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({ error: error.message });
   }
 });
 
 // 2. Get Item Classification List
 router.post('/itemClass/selectItemsClass', async (req, res) => {
+  console.log('📤 Get Item Classifications called with:', req.body);
   try {
     const { tin, bhfId, lastReqDt } = req.body;
+    
+    console.log('⏳ Calling VSCU...');
     
     const response = await axios.post(
       `${vscuClient.baseUrl}/itemClass/selectItemsClass`,
@@ -377,19 +597,26 @@ router.post('/itemClass/selectItemsClass', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('📥 VSCU Response Code:', response.data?.resultCd);
+    console.log('📥 VSCU Response Msg:', response.data?.resultMsg);
+    console.log('📦 itemClsList length:', response.data?.data?.itemClsList?.length || 0);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch classifications:', error.message);
+    console.error('❌ Failed to fetch classifications:', error.message);
+    if (error.response) {
+      console.error('VSCU Error Status:', error.response.status);
+      console.error('VSCU Error Data:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({ error: error.message });
   }
 });
 
 // 3. Get Customer by PIN
 router.post('/customers/selectCustomer', async (req, res) => {
+  console.log('📤 Looking up customer PIN:', req.body?.custmTin);
   try {
     const { tin, bhfId, custmTin } = req.body;
-    
-    console.log('📤 Looking up customer PIN:', custmTin);
     
     const response = await axios.post(
       `${vscuClient.baseUrl}/customers/selectCustomer`,
@@ -397,15 +624,18 @@ router.post('/customers/selectCustomer', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('📥 VSCU Response Code:', response.data?.resultCd);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch customer:', error.message);
+    console.error('❌ Failed to fetch customer:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
 // 4. Get Notice List
 router.post('/notices/selectNotices', async (req, res) => {
+  console.log('📤 Get Notices called');
   try {
     const { tin, bhfId, lastReqDt } = req.body;
     
@@ -415,9 +645,11 @@ router.post('/notices/selectNotices', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('📥 VSCU Response Code:', response.data?.resultCd);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch notices:', error.message);
+    console.error('❌ Failed to fetch notices:', error.message);
     res.status(500).json({ error: error.message });
   }
 });

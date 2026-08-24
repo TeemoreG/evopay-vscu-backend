@@ -4,26 +4,151 @@ const router = express.Router();
 const db = require('../db');
 const axios = require('axios');
 const vscuClient = require('../services/vscuClient');
-
 // ============================================
 // VSCU PROXY ENDPOINTS
 // ============================================
 
 // Get items from VSCU
 router.post('/selectItems', async (req, res) => {
-  console.log('ITEMS POST ROUTE HIT!');
+  console.log('===== SELECT ITEMS PROXY =====');
   try {
     const { tin, bhfId, lastReqDt } = req.body;
+
+    const headers = {
+      'tin': tin || process.env.TIN,
+      'bhfId': bhfId || process.env.BHF_ID,
+      'cmckey': process.env.CMCKEY,
+      'Content-Type': 'application/json'
+    };
+    
+    const payload = {
+      tin: tin || process.env.TIN,
+      bhfId: bhfId || process.env.BHF_ID,
+      lastReqDt: lastReqDt || '20200101000000'
+    };
+    
+    console.log('   Headers:', JSON.stringify(headers, null, 2));
+    console.log('   Payload:', JSON.stringify(payload, null, 2));
+    console.log('   Target:', `${vscuClient.baseUrl}/items/selectItems`);
     
     const response = await axios.post(
       `${vscuClient.baseUrl}/items/selectItems`,
-      { tin, bhfId, lastReqDt },
-      { headers: vscuClient.getHeaders(true) }
+      payload,
+      { headers, timeout: 30000 }
     );
+    
+    console.log('📥 Response Code:', response.data?.resultCd);
+    console.log('📥 Response Msg:', response.data?.resultMsg);
+    
+    // If 899, return empty list gracefully
+    if (response.data?.resultCd === '899') {
+      console.log('⚠️ selectItems returned 899 - returning empty list');
+      return res.json({
+        resultCd: '000',
+        resultMsg: 'No items available',
+        data: { itemList: [] }
+      });
+    }
     
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch items from VSCU:', error);
+    console.error('❌ selectItems Error:', error.message);
+    if (error.response?.data) {
+      console.error('❌ VSCU Response:', error.response.data);
+    }
+    // Return empty list on error (graceful fallback)
+    res.json({
+      resultCd: '000',
+      resultMsg: 'Fallback: No items returned',
+      data: { itemList: [] }
+    });
+  }
+});
+
+// ============================================
+// VSCU PROXY - Send Item to VSCU (saveItems)
+// ============================================
+router.post('/saveItems', async (req, res) => {
+  console.log(' ===== SAVE ITEMS PROXY =====');
+  try {
+    const payload = req.body;
+    if (!payload.tin || payload.tin === '') {
+      payload.tin = process.env.TIN;
+    }
+    if (!payload.bhfId || payload.bhfId === '') {
+      payload.bhfId = process.env.BHF_ID;
+    }
+    const headers = {
+      'tin': payload.tin || process.env.TIN,
+      'bhfId': payload.bhfId || process.env.BHF_ID,
+      'cmckey': process.env.CMCKEY,
+      'Content-Type': 'application/json'
+    };
+    
+    console.log('   Headers:', JSON.stringify(headers, null, 2));
+    console.log('   Payload:', JSON.stringify(payload, null, 2));
+    console.log('   Target:', `${vscuClient.baseUrl}/items/saveItems`);
+    
+    const response = await axios.post(
+      `${vscuClient.baseUrl}/items/saveItems`,
+      payload,
+      { headers, timeout: 30000 }
+    );
+    
+    console.log('📥 Response Code:', response.data?.resultCd);
+    console.log('📥 Response Msg:', response.data?.resultMsg);
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ saveItems Error:', error.message);
+    if (error.response?.data) {
+      console.error('❌ VSCU Response:', error.response.data);
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// VSCU PROXY - Send Item Composition
+// ============================================
+router.post('/saveItemComposition', async (req, res) => {
+  console.log(' ===== SAVE ITEM COMPOSITION PROXY =====');
+  try {
+    const payload = req.body;
+    
+    // FIX: Force tin from env if empty
+    if (!payload.tin || payload.tin === '') {
+      payload.tin = process.env.TIN;
+    }
+    if (!payload.bhfId || payload.bhfId === '') {
+      payload.bhfId = process.env.BHF_ID;
+    }
+    
+    const headers = {
+      'tin': payload.tin,
+      'bhfId': payload.bhfId,
+      'cmckey': process.env.CMCKEY,
+      'Content-Type': 'application/json'
+    };
+    
+    console.log('   Headers:', JSON.stringify(headers, null, 2));
+    console.log('   Payload:', JSON.stringify(payload, null, 2));
+    console.log('   Target:', `${vscuClient.baseUrl}/items/saveItemComposition`);
+    
+    const response = await axios.post(
+      `${vscuClient.baseUrl}/items/saveItemComposition`,
+      payload,
+      { headers, timeout: 30000 }
+    );
+    
+    console.log('📥 Response Code:', response.data?.resultCd);
+    console.log('📥 Response Msg:', response.data?.resultMsg);
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ saveItemComposition Error:', error.message);
+    if (error.response?.data) {
+      console.error('❌ VSCU Response:', error.response.data);
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -69,334 +194,12 @@ router.get('/', async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
+    console.error('❌ Get items error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get single item
-router.get('/:itemCd', async (req, res) => {
-  try {
-    const row = await db.getAsync(
-      `SELECT * FROM items WHERE item_cd = ?`,
-      [req.params.itemCd]
-    );
-    if (!row) {
-      return res.status(404).json({ error: 'Item not found' });
-    }
-    res.json(row);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add or update item
-router.post('/', async (req, res) => {
-  try {
-    const item = req.body;
-    const now = new Date().toISOString();
-
-    // Validate required fields
-    if (!item.itemCd || !item.itemNm) {
-      return res.status(400).json({ error: 'itemCd and itemNm are required' });
-    }
-
-    // ============================================
-    // BUILD VSCU PAYLOAD
-    // ============================================
-    const itemCode = item.itemCd || item.item_cd;
-    const vscuPayload = mapItemToVSCU(item);
-
-    console.log('📤 Item Payload to VSCU:', JSON.stringify(vscuPayload, null, 2));
-
-    // ============================================
-    // 1. SAVE TO DATABASE FIRST (ALWAYS)
-    // ============================================
-    await db.runAsync(
-      `INSERT OR REPLACE INTO items 
-       (item_cd, item_name, item_std_nm, item_cls_cd, item_ty_cd, price, tax_type, stock, sfty_qty,
-        orgn_nat_cd, pkg_unit_cd, qty_unit_cd, use_yn, isrc_aplcb_yn, btch_no, bcd, add_info,
-        synced, sync_error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-      [
-        item.itemCd || item.item_cd,
-        item.itemNm || item.item_name,
-        item.itemStdNm || item.item_std_nm || null,
-        item.itemClsCd || item.item_cls_cd || '50101010',
-        item.itemTyCd || item.item_ty_cd || '1',
-        Number(item.dftPrc || item.price || 0),
-        item.taxTyCd || item.tax_type || 'B',
-        Number(item.stock || 0),
-        Number(item.sftyQty || item.sfty_qty || 5),
-        item.orgnNatCd || item.orgn_nat_cd || 'KE',
-        item.pkgUnitCd || item.pkg_unit_cd || 'NT',
-        item.qtyUnitCd || item.qty_unit_cd || 'U',
-        item.useYn || item.use_yn || 'Y',
-        item.isrcAplcbYn || item.isrc_aplcb_yn || 'N',
-        item.btchNo || item.btch_no || null,
-        item.bcd || null,
-        item.addInfo || item.add_info || null,
-        null,  // sync_error (default null)
-        now,
-        now
-      ]
-    );
-
-    console.log(`✅ Item ${itemCode} saved to database (synced = 0)`);
-
-    // ============================================
-    // 2. THEN TRY TO SYNC TO VSCU
-    // ============================================
-    let synced = false;
-    let queued = false;
-    let vscuResponse = null;
-
-    try {
-      // Check if VSCU is reachable
-      const status = await vscuClient.checkStatus();
-      
-      if (status.connected) {
-        vscuResponse = await vscuClient.saveItem(vscuPayload);
-        const resCd = vscuResponse?.resultCd;
-
-        if (resCd === '000' || resCd === '00') {
-          // VSCU Success - update database
-          await db.runAsync(
-            `UPDATE items SET synced = 1, sync_error = NULL, updated_at = ? WHERE item_cd = ?`,
-            [now, itemCode]
-          );
-          synced = true;
-          console.log(`✅ Item ${itemCode} synced to VSCU`);
-        } else {
-          // VSCU rejected - DO NOT QUEUE (broken payload)
-          const errMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'Validation Error';
-          console.error(`❌ VSCU Error - Item ${itemCode} [Code ${resCd}]: ${errMsg}`);
-          
-          await db.runAsync(
-            `UPDATE items SET sync_error = ?, updated_at = ? WHERE item_cd = ?`,
-            [`[${resCd}] ${errMsg}`, now, itemCode]
-          );
-        }
-      } else {
-        // VSCU offline - QUEUE for later
-        console.log('VSCU offline - queuing item for later');
-        await db.runAsync(
-          `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
-          ['/items/saveItems', JSON.stringify(vscuPayload), 'VSCU offline', now]
-        );
-        queued = true;
-        console.log(`Item ${itemCode} queued for VSCU sync (VSCU offline)`);
-      }
-    } catch (vscuError) {
-      // Network/Timeout - QUEUE for later
-      console.error('VSCU Network error:', vscuError.message);
-      await db.runAsync(
-        `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
-        ['/items/saveItems', JSON.stringify(vscuPayload), vscuError.message || 'Network Timeout', now]
-      );
-      queued = true;
-      console.log(`Item ${itemCode} queued for VSCU sync (Network error)`);
-    }
-
-    const updatedItem = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [itemCode]);
-
-    res.json({
-      success: true,
-      item: updatedItem,
-      synced: synced,
-      queued: queued,
-      vscuResponse: vscuResponse,
-      message: synced ? 'Item synced to KRA' : queued ? 'Item saved and queued for sync' : 'Item saved locally'
-    });
-
-  } catch (error) {
-    console.error('Save item error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Delete item (soft delete - set use_yn to 'N')
-router.delete('/:itemCd', async (req, res) => {
-  try {
-    const item = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [req.params.itemCd]);
-    if (!item) {
-      return res.status(404).json({ error: 'Item not found' });
-    }
-
-    const now = new Date().toISOString();
-    
-    // Remove any existing sync_queue entries for this item (prevent duplicate queue)
-    await db.runAsync(
-      `DELETE FROM sync_queue WHERE endpoint = '/items/saveItems' AND json_extract(payload, '$.itemCd') = ?`,
-      [req.params.itemCd]
-    );
-
-    // Queue deletion to VSCU
-    const vscuPayload = {
-      tin: process.env.TIN,
-      bhfId: process.env.BHF_ID,
-      itemCd: req.params.itemCd,
-      useYn: 'N',
-      regrId: 'Admin',
-      regrNm: 'Admin',
-      modrId: 'Admin',
-      modrNm: 'Admin'
-    };
-
-    await db.runAsync(
-      `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
-      ['/items/saveItems', JSON.stringify(vscuPayload), 'Deletion queued', now]
-    );
-
-    await db.runAsync(
-      `UPDATE items SET use_yn = 'N', synced = 0, updated_at = ? WHERE item_cd = ?`,
-      [now, req.params.itemCd]
-    );
-
-    res.json({ 
-      success: true, 
-      message: 'Item deactivated and queued for VSCU deletion' 
-    });
-  } catch (error) {
-    console.error('Delete item error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-// Adjust stock for an item
-router.patch('/:itemCd/stock', async (req, res) => {
-  try {
-    const { quantity, type, reason } = req.body;
-    const itemCd = req.params.itemCd;
-    const now = new Date().toISOString();
-
-    if (!quantity || !type) {
-      return res.status(400).json({ error: 'quantity and type are required' });
-    }
-
-    const item = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [itemCd]);
-    if (!item) {
-      return res.status(404).json({ error: 'Item not found' });
-    }
-
-    const delta = type === 'IN' ? quantity : -quantity;
-    const newStock = Math.max(0, item.stock + delta);
-
-    await db.runAsync(
-      `UPDATE items SET stock = ?, updated_at = ? WHERE item_cd = ?`,
-      [newStock, now, itemCd]
-    );
-
-    await db.runAsync(
-      `INSERT INTO stock_movements (item_cd, quantity, type, reference, note, date, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [itemCd, Math.abs(quantity), type, 'Manual adjustment', reason || null, now.slice(0, 10), now]
-    );
-
-    res.json({
-      success: true,
-      itemCd,
-      oldStock: item.stock,
-      newStock: newStock,
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Search items
-router.get('/search/:query', async (req, res) => {
-  try {
-    const query = `%${req.params.query}%`;
-    const rows = await db.allAsync(
-      `SELECT * FROM items 
-       WHERE use_yn = 'Y' 
-       AND (item_name LIKE ? OR item_cd LIKE ? OR bcd LIKE ?)
-       ORDER BY item_name`,
-      [query, query, query]
-    );
-    res.json(rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get items by tax type
-router.get('/tax/:taxType', async (req, res) => {
-  try {
-    const rows = await db.allAsync(
-      `SELECT * FROM items WHERE use_yn = 'Y' AND tax_type = ? ORDER BY item_name`,
-      [req.params.taxType]
-    );
-    res.json(rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Bulk import items
-router.post('/bulk', async (req, res) => {
-  try {
-    const items = req.body;
-    const now = new Date().toISOString();
-    let imported = 0;
-    let errors = [];
-    let queued = 0;
-
-    for (const item of items) {
-      try {
-        if (!item.itemCd || !item.itemNm) {
-          errors.push({ item, error: 'Missing required fields' });
-          continue;
-        }
-
-        await db.runAsync(
-          `INSERT OR REPLACE INTO items 
-           (item_cd, item_name, item_cls_cd, price, tax_type, stock, orgn_nat_cd, pkg_unit_cd, qty_unit_cd, use_yn, synced, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
-          [
-            item.itemCd,
-            item.itemNm,
-            item.itemClsCd || '50101010',
-            Number(item.dftPrc || item.price || 0),
-            item.taxTyCd || 'B',
-            Number(item.stock || 0),
-            item.orgnNatCd || 'KE',
-            item.pkgUnitCd || 'NT',
-            item.qtyUnitCd || 'U',
-            item.useYn || 'Y',
-            now,
-            now
-          ]
-        );
-        
-        try {
-          const vscuPayload = mapItemToVSCU(item);
-          await db.runAsync(
-            `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
-            ['/items/saveItems', JSON.stringify(vscuPayload), 'Bulk import queued', now]
-          );
-          queued++;
-        } catch (queueError) {
-          errors.push({ item, error: 'Failed to queue for VSCU: ' + queueError.message });
-        }
-        
-        imported++;
-      } catch (err) {
-        errors.push({ item, error: err.message });
-      }
-    }
-
-    res.json({
-      success: true,
-      imported,
-      queued,
-      errors: errors.length > 0 ? errors : undefined,
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ===== ITEM COMPOSITION ROUTES =====
+// ===== ITEM COMPOSITION ROUTES 
 
 // Get all compositions for an item
 router.get('/:itemCd/compositions', async (req, res) => {
@@ -423,7 +226,7 @@ router.get('/:itemCd/compositions', async (req, res) => {
     
     res.json({ success: true, data: compositions });
   } catch (error) {
-    console.error('Get compositions error:', error);
+    console.error('❌ Get compositions error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -523,7 +326,7 @@ router.post('/:itemCd/compositions', async (req, res) => {
             ['/items/saveItemComposition', JSON.stringify(vscuPayload), errorMsg, now]
           );
           queued = true;
-          console.log(`Composition ${itemCd}->${cpstItemCd} queued (${errorMsg})`);
+          console.log(`⏳ Composition ${itemCd}->${cpstItemCd} queued (${errorMsg})`);
         }
       } else {
         const vscuPayload = {
@@ -540,10 +343,10 @@ router.post('/:itemCd/compositions', async (req, res) => {
           ['/items/saveItemComposition', JSON.stringify(vscuPayload), 'VSCU offline', now]
         );
         queued = true;
-        console.log(`VSCU offline - Composition ${itemCd}->${cpstItemCd} queued`);
+        console.log(`⏳ VSCU offline - Composition ${itemCd}->${cpstItemCd} queued`);
       }
     } catch (vscuError) {
-      console.error('VSCU composition error:', vscuError);
+      console.error('❌ VSCU composition error:', vscuError);
       const vscuPayload = {
         tin: process.env.TIN,
         bhfId: process.env.BHF_ID,
@@ -581,7 +384,7 @@ router.post('/:itemCd/compositions', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Save composition error:', error);
+    console.error('❌ Save composition error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -630,10 +433,10 @@ router.delete('/:itemCd/compositions/:cpstItemCd', async (req, res) => {
           `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
           ['/items/saveItemComposition', JSON.stringify(vscuPayload), 'Deletion queued', now]
         );
-        console.log(`Composition ${itemCd}->${cpstItemCd} queued for deletion`);
+        console.log(`⏳ Composition ${itemCd}->${cpstItemCd} queued for deletion`);
       }
     } catch (queueError) {
-      console.error('Queue deletion error:', queueError);
+      console.error('❌ Queue deletion error:', queueError);
     }
 
     res.json({ 
@@ -642,7 +445,7 @@ router.delete('/:itemCd/compositions/:cpstItemCd', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Delete composition error:', error);
+    console.error('❌ Delete composition error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -682,8 +485,354 @@ router.post('/compositions/bulk', async (req, res) => {
 
     res.json({ success: true, data: grouped });
   } catch (error) {
-    console.error('Bulk compositions error:', error);
+    console.error('❌ Bulk compositions error:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ===== SINGLE ITEM ROUTE - MUST COME AFTER COMPOSITION ROUTES =====
+
+// Get single item
+router.get('/:itemCd', async (req, res) => {
+  try {
+    const row = await db.getAsync(
+      `SELECT * FROM items WHERE item_cd = ?`,
+      [req.params.itemCd]
+    );
+    if (!row) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+    res.json(row);
+  } catch (error) {
+    console.error('❌ Get item error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add or update item
+router.post('/', async (req, res) => {
+  try {
+    const item = req.body;
+    const now = new Date().toISOString();
+
+    // Validate required fields
+    if (!item.itemCd || !item.itemNm) {
+      return res.status(400).json({ error: 'itemCd and itemNm are required' });
+    }
+
+    // ============================================
+    // BUILD VSCU PAYLOAD
+    // ============================================
+    const itemCode = item.itemCd || item.item_cd;
+    const vscuPayload = mapItemToVSCU(item);
+
+    console.log('Item Payload to VSCU:', JSON.stringify(vscuPayload, null, 2));
+
+    // ============================================
+    // 1. SAVE TO DATABASE FIRST (ALWAYS)
+    // ============================================
+    await db.runAsync(
+      `INSERT OR REPLACE INTO items 
+       (item_cd, item_name, item_std_nm, item_cls_cd, item_ty_cd, price, tax_type, stock, sfty_qty,
+        orgn_nat_cd, pkg_unit_cd, qty_unit_cd, use_yn, isrc_aplcb_yn, btch_no, bcd, add_info,
+        synced, sync_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [
+        item.itemCd || item.item_cd,
+        item.itemNm || item.item_name,
+        item.itemStdNm || item.item_std_nm || null,
+        item.itemClsCd || item.item_cls_cd || '50101010',
+        item.itemTyCd || item.item_ty_cd || '1',
+        Number(item.dftPrc || item.price || 0),
+        item.taxTyCd || item.tax_type || 'B',
+        Number(item.stock || 0),
+        Number(item.sftyQty || item.sfty_qty || 5),
+        item.orgnNatCd || item.orgn_nat_cd || 'KE',
+        item.pkgUnitCd || item.pkg_unit_cd || 'NT',
+        item.qtyUnitCd || item.qty_unit_cd || 'U',
+        item.useYn || item.use_yn || 'Y',
+        item.isrcAplcbYn || item.isrc_aplcb_yn || 'N',
+        item.btchNo || item.btch_no || null,
+        item.bcd || null,
+        item.addInfo || item.add_info || null,
+        null,  // sync_error (default null)
+        now,
+        now
+      ]
+    );
+
+    console.log(`✅ Item ${itemCode} saved to database (synced = 0)`);
+
+    // ============================================
+    // 2. THEN TRY TO SYNC TO VSCU
+    // ============================================
+    let synced = false;
+    let queued = false;
+    let vscuResponse = null;
+
+    try {
+      console.log('⏳ Checking VSCU status...');
+      const status = await vscuClient.checkStatus();
+      console.log('📡 VSCU status:', status);
+
+      if (status.connected) {
+        console.log('⏳ Sending item to VSCU...');
+        vscuResponse = await vscuClient.saveItem(vscuPayload);
+        
+        console.log('📥 VSCU Response:', JSON.stringify(vscuResponse, null, 2));
+        
+        const resCd = vscuResponse?.resultCd;
+
+        if (resCd === '000' || resCd === '00') {
+          // VSCU Success - update database
+          await db.runAsync(
+            `UPDATE items SET synced = 1, sync_error = NULL, updated_at = ? WHERE item_cd = ?`,
+            [now, itemCode]
+          );
+          synced = true;
+          console.log(`✅ Item ${itemCode} synced to VSCU`);
+        } else {
+          // VSCU rejected - DO NOT QUEUE (broken payload)
+          const errMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'Validation Error';
+          console.error(`❌ VSCU Error - Item ${itemCode} [Code ${resCd}]: ${errMsg}`);
+          
+          await db.runAsync(
+            `UPDATE items SET sync_error = ?, updated_at = ? WHERE item_cd = ?`,
+            [`[${resCd}] ${errMsg}`, now, itemCode]
+          );
+        }
+      } else {
+        // VSCU offline - QUEUE for later
+        console.log('⏳ VSCU offline - queuing item for later');
+        await db.runAsync(
+          `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
+          ['/items/saveItems', JSON.stringify(vscuPayload), 'VSCU offline', now]
+        );
+        queued = true;
+        console.log(`⏳ Item ${itemCode} queued for VSCU sync (VSCU offline)`);
+      }
+    } catch (vscuError) {
+      // Network/Timeout - QUEUE for later
+      console.error('❌ VSCU Network error:', vscuError.message);
+      if (vscuError.code === 'ECONNABORTED') {
+        console.error('⏰ Request timed out');
+      }
+      await db.runAsync(
+        `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
+        ['/items/saveItems', JSON.stringify(vscuPayload), vscuError.message || 'Network Timeout', now]
+      );
+      queued = true;
+      console.log(`⏳ Item ${itemCode} queued for VSCU sync (Network error)`);
+    }
+
+    const updatedItem = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [itemCode]);
+
+    res.json({
+      success: true,
+      item: updatedItem,
+      synced: synced,
+      queued: queued,
+      vscuResponse: vscuResponse,
+      message: synced ? 'Item synced to KRA' : queued ? 'Item saved and queued for sync' : 'Item saved locally'
+    });
+
+  } catch (error) {
+    console.error('❌ Save item error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete item (soft delete - set use_yn to 'N')
+router.delete('/:itemCd', async (req, res) => {
+  try {
+    const item = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [req.params.itemCd]);
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    const now = new Date().toISOString();
+    
+    // Remove any existing sync_queue entries for this item (prevent duplicate queue)
+    await db.runAsync(
+      `DELETE FROM sync_queue WHERE endpoint = '/items/saveItems' AND json_extract(payload, '$.itemCd') = ?`,
+      [req.params.itemCd]
+    );
+
+    // Queue deletion to VSCU
+    const vscuPayload = {
+      tin: process.env.TIN,
+      bhfId: process.env.BHF_ID,
+      itemCd: req.params.itemCd,
+      useYn: 'N',
+      regrId: 'Admin',
+      regrNm: 'Admin',
+      modrId: 'Admin',
+      modrNm: 'Admin'
+    };
+
+    await db.runAsync(
+      `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
+      ['/items/saveItems', JSON.stringify(vscuPayload), 'Deletion queued', now]
+    );
+
+    await db.runAsync(
+      `UPDATE items SET use_yn = 'N', synced = 0, updated_at = ? WHERE item_cd = ?`,
+      [now, req.params.itemCd]
+    );
+
+    res.json({ 
+      success: true, 
+      message: 'Item deactivated and queued for VSCU deletion' 
+    });
+  } catch (error) {
+    console.error('❌ Delete item error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Adjust stock for an item
+router.patch('/:itemCd/stock', async (req, res) => {
+  try {
+    const { quantity, type, reason } = req.body;
+    const itemCd = req.params.itemCd;
+    const now = new Date().toISOString();
+
+    if (!quantity || !type) {
+      return res.status(400).json({ error: 'quantity and type are required' });
+    }
+
+    const item = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [itemCd]);
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    // Validate stock before calculating
+if (type === 'OUT' && item.stock < quantity) {
+  toast.error(`Not enough stock! Available: ${item.stock}, Requested: ${quantity}`);
+  return; // Stop execution
+}
+
+// Then calculate 
+const delta = type === 'IN' ? quantity : -quantity;
+const newStock = item.stock + delta;
+
+    await db.runAsync(
+      `UPDATE items SET stock = ?, updated_at = ? WHERE item_cd = ?`,
+      [newStock, now, itemCd]
+    );
+
+    await db.runAsync(
+      `INSERT INTO stock_movements (item_cd, quantity, type, reference, note, date, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [itemCd, Math.abs(quantity), type, 'Manual adjustment', reason || null, now.slice(0, 10), now]
+    );
+
+    res.json({
+      success: true,
+      itemCd,
+      oldStock: item.stock,
+      newStock: newStock,
+    });
+  } catch (error) {
+    console.error('❌ Stock adjustment error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Search items
+router.get('/search/:query', async (req, res) => {
+  try {
+    const query = `%${req.params.query}%`;
+    const rows = await db.allAsync(
+      `SELECT * FROM items 
+       WHERE use_yn = 'Y' 
+       AND (item_name LIKE ? OR item_cd LIKE ? OR bcd LIKE ?)
+       ORDER BY item_name`,
+      [query, query, query]
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error('❌ Search error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get items by tax type
+router.get('/tax/:taxType', async (req, res) => {
+  try {
+    const rows = await db.allAsync(
+      `SELECT * FROM items WHERE use_yn = 'Y' AND tax_type = ? ORDER BY item_name`,
+      [req.params.taxType]
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error('❌ Tax filter error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Bulk import items
+router.post('/bulk', async (req, res) => {
+  try {
+    const items = req.body;
+    const now = new Date().toISOString();
+    let imported = 0;
+    let errors = [];
+    let queued = 0;
+
+    for (const item of items) {
+      try {
+        if (!item.itemCd || !item.itemNm) {
+          errors.push({ item, error: 'Missing required fields' });
+          continue;
+        }
+
+        await db.runAsync(
+          `INSERT OR REPLACE INTO items 
+           (item_cd, item_name, item_cls_cd, price, tax_type, stock, orgn_nat_cd, pkg_unit_cd, qty_unit_cd, use_yn, synced, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+          [
+            item.itemCd,
+            item.itemNm,
+            item.itemClsCd || '50101010',
+            Number(item.dftPrc || item.price || 0),
+            item.taxTyCd || 'B',
+            Number(item.stock || 0),
+            item.orgnNatCd || 'KE',
+            item.pkgUnitCd || 'NT',
+            item.qtyUnitCd || 'U',
+            item.useYn || 'Y',
+            now,
+            now
+          ]
+        );
+        
+        try {
+          const vscuPayload = mapItemToVSCU(item);
+          await db.runAsync(
+            `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
+            ['/items/saveItems', JSON.stringify(vscuPayload), 'Bulk import queued', now]
+          );
+          queued++;
+        } catch (queueError) {
+          errors.push({ item, error: 'Failed to queue for VSCU: ' + queueError.message });
+        }
+        
+        imported++;
+      } catch (err) {
+        errors.push({ item, error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      imported,
+      queued,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (error) {
+    console.error('❌ Bulk import error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

@@ -285,7 +285,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
 ('version', '2.0.21'),
 ('environment', 'sandbox'),
 ('company_name', 'Evopay Limited'),
-('company_pin', 'P000607989R'),
+('company_pin', 'P600003965A'),
 ('branch_id', '00'),
 ('tax_rate_default', 'B');
 

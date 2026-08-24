@@ -10,6 +10,7 @@ const vscuClient = require('../services/vscuClient');
 
 // Get purchases from VSCU
 router.post('/selectTrnsPurchaseSales', async (req, res) => {
+  console.log('Fetching purchases from VSCU:', req.body);
   try {
     const { tin, bhfId, lastReqDt } = req.body;
     
@@ -19,9 +20,17 @@ router.post('/selectTrnsPurchaseSales', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('VSCU Response Code:', response.data?.resultCd);
+    console.log('VSCU Response Msg:', response.data?.resultMsg);
+    console.log('Purchase list length:', response.data?.data?.purchaseList?.length || 0);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch purchases from VSCU:', error);
+    console.error('Failed to fetch purchases from VSCU:', error.message);
+    if (error.response) {
+      console.error('VSCU Error Status:', error.response.status);
+      console.error('VSCU Error Data:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -41,12 +50,58 @@ router.get('/', async (req, res) => {
         [purchase.id]
       );
       purchase.items = items;
-       purchase.totItemCnt = items.length;
+      purchase.totItemCnt = items.length;
     }
     
+    console.log(`Fetched ${rows.length} purchases from database`);
     res.json(rows);
   } catch (error) {
     console.error('Error fetching purchases:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// BULK SAVE PURCHASES (from VSCU)
+router.post('/bulk', async (req, res) => {
+  try {
+    const purchaseList = req.body;
+    
+    if (!Array.isArray(purchaseList) || purchaseList.length === 0) {
+      return res.status(400).json({ error: 'Purchases array is required' });
+    }
+
+    const now = new Date().toISOString();
+    let saved = 0;
+
+    for (const purchase of purchaseList) {
+  await db.runAsync(
+    `INSERT OR REPLACE INTO purchases (
+      invoice_no, supplier_tin, supplier_name, supplier_invoice_no,
+      subtotal, tax, total, payment_method, status, synced,
+      vscu_signature, date, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      purchase.spplrInvcNo || purchase.invoice_no,
+      purchase.spplrTin || purchase.supplier_tin || null,
+      purchase.spplrNm || purchase.supplier_name || 'Unknown',
+      purchase.spplrInvcNo || purchase.supplier_invoice_no || null,
+      purchase.totTaxblAmt || purchase.subtotal || 0,
+      purchase.totTaxAmt || purchase.tax || 0,
+      purchase.totAmt || purchase.total || 0,
+      purchase.pmtTyCd || purchase.payment_method || '01',
+      'Completed',
+      1,
+      null,
+      purchase.salesDt || purchase.date || now.slice(0, 10),
+      now
+    ]
+  );
+  saved++;
+}
+    console.log(`Bulk saved ${saved} purchases from VSCU`);
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Bulk save purchases error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -57,7 +112,6 @@ router.post('/', async (req, res) => {
     const data = req.body;
     const now = new Date().toISOString();
 
-    // Validate required fields
     if (!data.supplier_name) {
       return res.status(400).json({ error: 'Supplier name is required' });
     }
@@ -66,21 +120,38 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'At least one item is required' });
     }
 
-    // Generate invoice number if not provided
     const invoiceNo = data.invoice_no || `PUR-${Date.now().toString().slice(-6)}`;
 
-    // ============================================
-    // 1. BUILD VSCU PAYLOAD
-    // ============================================
+    let calculatedSubtotal = 0;
+    let calculatedTax = 0;
+    let calculatedTotal = 0;
+
+    for (const item of data.items) {
+      const qty = Number(item.qty || item.quantity || 0);
+      const price = Number(item.prc || item.price || 0);
+      const taxRate = item.taxTyCd === 'B' ? 16 : 0;
+      
+      const itemSubtotal = qty * price;
+      const itemTax = itemSubtotal * (taxRate / 100);
+      
+      calculatedSubtotal += itemSubtotal;
+      calculatedTax += itemTax;
+      calculatedTotal += itemSubtotal + itemTax;
+    }
+
+    const subtotal = data.subtotal || calculatedSubtotal;
+    const tax = data.tax || calculatedTax;
+    const total = data.total || calculatedTotal;
+
     const vscuPayload = {
       tin: process.env.TIN,
       bhfId: process.env.BHF_ID,
       invcNo: parseInt(invoiceNo.replace('PUR-', '')) || 1,
       orgInvcNo: 0,
-      spplrTin: data.supplier_tin || null,
-      spplrBhfId: '00',
-      spplrNm: data.supplier_name,
-      spplrInvcNo: data.supplier_invoice_no || null,
+      spplrTin: null,
+      spplrBhfId: null,
+      spplrNm: null,
+      spplrInvcNo: null,
       regTyCd: 'M',
       pchsTyCd: 'N',
       rcptTyCd: 'P',
@@ -94,58 +165,63 @@ router.post('/', async (req, res) => {
       rfdDt: '',
       totItemCnt: Number(data.items.length),
       taxblAmtA: 0,
-      taxblAmtB: Number(data.subtotal || 0),
+      taxblAmtB: Number(subtotal),
       taxblAmtC: 0,
       taxblAmtD: 0,
       taxblAmtE: 0,
       taxRtA: 0,
-      taxRtB: 16,
+      taxRtB: 18,
       taxRtC: 0,
       taxRtD: 0,
       taxRtE: 0,
       taxAmtA: 0,
-      taxAmtB: Number(data.tax || 0),
+      taxAmtB: Number(tax),
       taxAmtC: 0,
       taxAmtD: 0,
       taxAmtE: 0,
-      totTaxblAmt: Number(data.subtotal || 0),
-      totTaxAmt: Number(data.tax || 0),
-      totAmt: Number(data.total || 0),
+      totTaxblAmt: Number(subtotal),
+      totTaxAmt: Number(tax),
+      totAmt: Number(total),
       remark: data.remark || null,
       regrNm: data.cashier || 'Admin',
       regrId: data.cashier || 'Admin',
       modrNm: data.cashier || 'Admin',
       modrId: data.cashier || 'Admin',
-      itemList: data.items.map((item, idx) => ({
-        itemSeq: idx + 1,
-        itemCd: item.itemCd,
-        itemClsCd: item.itemClsCd || '50101010',
-        itemNm: item.itemNm || item.item_name,
-        bcd: null,
-        spplrItemClsCd: null,
-        spplrItemCd: null,
-        spplrItemNm: null,
-        pkgUnitCd: 'NT',
-        pkg: 1,
-        qtyUnitCd: 'U',
-        qty: Number(item.qty || item.quantity || 0),
-        prc: Number(item.prc || item.price || 0),
-        splyAmt: Number((item.qty || item.quantity || 0) * (item.prc || item.price || 0)),
-        dcRt: 0,
-        dcAmt: 0,
-        taxblAmt: Number((item.qty || item.quantity || 0) * (item.prc || item.price || 0)),
-        taxTyCd: item.taxTyCd || item.tax_type || 'B',
-        taxAmt: Number(item.taxAmt || item.tax_amount || 0),
-        totAmt: Number(item.totAmt || item.total || 0),
-        itemExprDt: null
-      }))
+      itemList: data.items.map((item, idx) => {
+        const qty = Number(item.qty || item.quantity || 0);
+        const price = Number(item.prc || item.price || 0);
+        const itemSubtotal = qty * price;
+        const taxRate = 18;
+        const itemTax = itemSubtotal * (taxRate / 100);
+        
+        return {
+          itemSeq: idx + 1,
+          itemCd: item.itemCd,
+          itemClsCd: item.itemClsCd || '5059690800',
+          itemNm: item.itemNm || item.item_name || 'Unknown',
+          bcd: '',
+          spplrItemClsCd: null,
+          spplrItemCd: null,
+          spplrItemNm: null,
+          pkgUnitCd: 'NT',
+          pkg: 1,
+          qtyUnitCd: 'U',
+          qty: qty,
+          prc: price,
+          splyAmt: itemSubtotal,
+          dcRt: 0,
+          dcAmt: 0,
+          taxblAmt: itemSubtotal,
+          taxTyCd: item.taxTyCd || item.tax_type || 'B',
+          taxAmt: Number(item.taxAmt || item.tax_amount || itemTax),
+          totAmt: Number(item.totAmt || item.total || itemSubtotal + itemTax),
+          itemExprDt: null
+        };
+      })
     };
 
-    console.log('📤 Purchase Payload to VSCU:', JSON.stringify(vscuPayload, null, 2));
+    console.log('Purchase Payload to VSCU:', JSON.stringify(vscuPayload, null, 2));
 
-    // ============================================
-    // 2. SAVE TO DATABASE FIRST (ALWAYS)
-    // ============================================
     const result = await db.runAsync(
       `INSERT INTO purchases 
        (invoice_no, supplier_tin, supplier_name, supplier_invoice_no, 
@@ -157,9 +233,9 @@ router.post('/', async (req, res) => {
         data.supplier_tin || null,
         data.supplier_name,
         data.supplier_invoice_no || null,
-        Number(data.subtotal || 0),
-        Number(data.tax || 0),
-        Number(data.total || 0),
+        Number(subtotal),
+        Number(tax),
+        Number(total),
         data.payment_method || '01',
         'Pending',
         0,
@@ -170,13 +246,16 @@ router.post('/', async (req, res) => {
     );
 
     const purchaseId = result.lastID;
-    console.log(`✅ Purchase ${invoiceNo} saved to database (synced = 0)`);
+    console.log(`Purchase ${invoiceNo} saved to database (synced = 0)`);
 
-    // ============================================
-    // 3. SAVE PURCHASE ITEMS TO DATABASE
-    // ============================================
     for (let i = 0; i < data.items.length; i++) {
       const item = data.items[i];
+      const qty = Number(item.qty || item.quantity || 0);
+      const price = Number(item.prc || item.price || 0);
+      const itemSubtotal = qty * price;
+      const taxRate = item.taxTyCd === 'B' ? 16 : 0;
+      const itemTax = itemSubtotal * (taxRate / 100);
+      
       await db.runAsync(
         `INSERT INTO purchase_items 
          (purchase_id, item_seq, item_cd, item_name, item_cls_cd, 
@@ -188,28 +267,23 @@ router.post('/', async (req, res) => {
           item.itemCd || item.item_cd,
           item.itemNm || item.item_name || 'Unknown',
           item.itemClsCd || item.item_cls_cd || '50101010',
-          Number(item.qty || item.quantity || 0),
-          Number(item.prc || item.price || 0),
+          qty,
+          price,
           item.taxTyCd || item.tax_type || 'B',
-          Number(item.taxAmt || item.tax_amount || 0),
-          Number(item.totAmt || item.total || 0)
+          Number(item.taxAmt || item.tax_amount || itemTax),
+          Number(item.totAmt || item.total || itemSubtotal + itemTax)
         ]
       );
     }
 
-    // ============================================
-    // 3.5 UPDATE LOCAL STOCK (IN)
-    // ============================================
     for (const item of data.items) {
+      const qty = Number(item.qty || item.quantity || 0);
       await db.runAsync(
         `UPDATE items SET stock = stock + ? WHERE item_cd = ?`,
-        [Number(item.qty || item.quantity || 0), item.itemCd]
+        [qty, item.itemCd]
       );
     }
 
-    // ============================================
-    // 4. THEN TRY TO SYNC TO VSCU
-    // ============================================
     let synced = false;
     let queued = false;
     let vscuResponse = null;
@@ -219,24 +293,37 @@ router.post('/', async (req, res) => {
       const status = await vscuClient.checkStatus();
       
       if (status.connected) {
-        vscuResponse = await vscuClient.savePurchase(vscuPayload);
-        console.log('VSCU Response:', vscuResponse);
-        
-        if (vscuResponse && (vscuResponse.resultCd === '000' || vscuResponse.resultCd === '00')) {
-          synced = true;
-          signature = vscuResponse.data?.rcptSign || '';
-          console.log(`✅ Purchase ${invoiceNo} synced to VSCU`);
-        } else {
-          const errorMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'VSCU error';
-          console.log(`VSCU returned ${vscuResponse?.resultCd || 'unknown'} - queuing purchase`);
+        try {
+          vscuResponse = await vscuClient.savePurchase(vscuPayload);
+          console.log('VSCU Response:', JSON.stringify(vscuResponse, null, 2));
+          
+          if (vscuResponse && (vscuResponse.resultCd === '000' || vscuResponse.resultCd === '00')) {
+            synced = true;
+            signature = vscuResponse.data?.rcptSign || '';
+            console.log(`Purchase ${invoiceNo} synced to VSCU`);
+          } else {
+            const errorMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'VSCU error';
+            console.log(`VSCU returned ${vscuResponse?.resultCd || 'unknown'} - queuing purchase`);
+            await db.runAsync(
+              `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
+              ['/purchases/savePurchases', JSON.stringify(vscuPayload), `VSCU: ${errorMsg}`, now]
+            );
+            queued = true;
+          }
+        } catch (vscuError) {
+          console.error('VSCU savePurchase error:', vscuError.message);
+          if (vscuError.response) {
+            console.error('VSCU Error Status:', vscuError.response.status);
+            console.error('VSCU Error Data:', JSON.stringify(vscuError.response.data, null, 2));
+          }
           await db.runAsync(
             `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
-            ['/purchases/savePurchases', JSON.stringify(vscuPayload), `VSCU: ${errorMsg}`, now]
+            ['/purchases/savePurchases', JSON.stringify(vscuPayload), vscuError.message || 'Network error', now]
           );
           queued = true;
         }
       } else {
-        console.log('VSCU offline - queuing purchase for later');
+        console.log('VSCU offline - queuing purchase');
         await db.runAsync(
           `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
           ['/purchases/savePurchases', JSON.stringify(vscuPayload), 'VSCU offline', now]
@@ -252,25 +339,23 @@ router.post('/', async (req, res) => {
       queued = true;
     }
 
-    // ============================================
-    // 5. UPDATE DATABASE WITH SYNC RESULT
-    // ============================================
     const finalStatus = synced ? 'Completed' : 'Pending';
     const syncedFlag = synced ? 1 : 0;
 
     await db.runAsync(
-      `UPDATE purchases 
-       SET status = ?, synced = ?, vscu_signature = ? 
-       WHERE id = ?`,
+      `UPDATE purchases SET status = ?, synced = ?, vscu_signature = ? WHERE id = ?`,
       [finalStatus, syncedFlag, signature || null, purchaseId]
     );
 
-    // ============================================
-    // 5.5 SYNC STOCK TO VSCU (only if purchase was synced)
-    // ============================================
     if (synced) {
       try {
         for (const item of data.items) {
+          const qty = Number(item.qty || item.quantity || 0);
+          const price = Number(item.prc || item.price || 0);
+          const itemSubtotal = qty * price;
+          const taxRate = item.taxTyCd === 'B' ? 16 : 0;
+          const itemTax = itemSubtotal * (taxRate / 100);
+          
           const stockPayload = {
             tin: process.env.TIN,
             bhfId: process.env.BHF_ID,
@@ -280,12 +365,12 @@ router.post('/', async (req, res) => {
             custTin: data.supplier_tin || null,
             custNm: data.supplier_name || null,
             custBhfId: null,
-            sarTyCd: '1', // IN
+            sarTyCd: '1',
             ocrnDt: (data.date || now.slice(0, 10)).replace(/-/g, ''),
             totItemCnt: 1,
-            totTaxblAmt: Number(item.subtotal || 0),
-            totTaxAmt: Number(item.tax_amount || 0),
-            totAmt: Number(item.total || 0),
+            totTaxblAmt: itemSubtotal,
+            totTaxAmt: itemTax,
+            totAmt: itemSubtotal + itemTax,
             remark: null,
             regrId: data.cashier || 'Admin',
             regrNm: data.cashier || 'Admin',
@@ -295,47 +380,39 @@ router.post('/', async (req, res) => {
               itemSeq: 1,
               itemCd: item.itemCd,
               itemClsCd: item.itemClsCd || '50101010',
-              itemNm: item.itemNm || item.item_name,
+              itemNm: item.itemNm || item.item_name || 'Unknown',
               bcd: null,
               pkgUnitCd: 'NT',
               pkg: 1,
               qtyUnitCd: 'U',
-              qty: Number(item.qty || item.quantity || 0),
+              qty: qty,
               itemExprDt: null,
-              prc: Number(item.prc || item.price || 0),
-              splyAmt: Number((item.qty || item.quantity || 0) * (item.prc || item.price || 0)),
+              prc: price,
+              splyAmt: itemSubtotal,
               totDcAmt: 0,
-              taxblAmt: Number((item.qty || item.quantity || 0) * (item.prc || item.price || 0)),
+              taxblAmt: itemSubtotal,
               taxTyCd: item.taxTyCd || item.tax_type || 'B',
-              taxAmt: Number(item.taxAmt || item.tax_amount || 0),
-              totAmt: Number(item.totAmt || item.total || 0)
+              taxAmt: itemTax,
+              totAmt: itemSubtotal + itemTax
             }]
           };
 
-          const stockResponse = await vscuClient.saveStock(stockPayload);
-          console.log(`Stock sync for ${item.itemCd}:`, stockResponse?.resultCd === '000' ? 'Success' : 'Failed');
+          try {
+            const stockResponse = await vscuClient.saveStock(stockPayload);
+            console.log(`Stock sync for ${item.itemCd}:`, stockResponse?.resultCd === '000' ? 'Success' : 'Failed');
+          } catch (stockError) {
+            console.error(`Stock sync error for ${item.itemCd}:`, stockError.message);
+          }
         }
       } catch (stockError) {
         console.error('Stock sync error:', stockError.message);
       }
     }
 
-    // ============================================
-    // 6. GET FINAL PURCHASE DATA
-    // ============================================
-    const savedPurchase = await db.getAsync(
-      `SELECT * FROM purchases WHERE id = ?`,
-      [purchaseId]
-    );
-    const savedItems = await db.allAsync(
-      `SELECT * FROM purchase_items WHERE purchase_id = ?`,
-      [purchaseId]
-    );
+    const savedPurchase = await db.getAsync(`SELECT * FROM purchases WHERE id = ?`, [purchaseId]);
+    const savedItems = await db.allAsync(`SELECT * FROM purchase_items WHERE purchase_id = ?`, [purchaseId]);
     savedPurchase.items = savedItems;
 
-    // ============================================
-    // 7. RETURN RESPONSE
-    // ============================================
     res.json({
       success: true,
       id: purchaseId,

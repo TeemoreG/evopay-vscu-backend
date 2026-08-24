@@ -46,7 +46,29 @@ router.post('/', async (req, res) => {
     console.log('Final payment method:', finalPaymentMethod);
 
     // ============================================
-    // 1. BUILD VSCU PAYLOAD
+    // 1. VALIDATE STOCK BEFORE ANYTHING
+    // ============================================
+    for (const item of items) {
+      const stockCheck = await db.getAsync(
+        `SELECT stock, item_name FROM items WHERE item_cd = ?`,
+        [item.item_cd]
+      );
+      
+      if (!stockCheck) {
+        return res.status(400).json({ 
+          error: `Item ${item.item_cd} not found` 
+        });
+      }
+      
+      if (stockCheck.stock < item.quantity) {
+        return res.status(400).json({ 
+          error: `Insufficient stock for ${stockCheck.item_name}! Available: ${stockCheck.stock}, Requested: ${item.quantity}` 
+        });
+      }
+    }
+
+    // ============================================
+    // 2. BUILD VSCU PAYLOAD
     // ============================================
     const vscuPayload = {
       tin: process.env.TIN,
@@ -129,7 +151,7 @@ router.post('/', async (req, res) => {
     console.log('..Sale Payload to VSCU..:', JSON.stringify(vscuPayload, null, 2));
 
     // ============================================
-    // 2. SAVE TO DATABASE FIRST (ALWAYS)
+    // 3. SAVE TO DATABASE FIRST (ALWAYS)
     // ============================================
     const result = await db.runAsync(
       `INSERT INTO sales 
@@ -142,10 +164,10 @@ router.post('/', async (req, res) => {
     );
 
     const saleId = result.lastID;
-    console.log(`✅ Sale ${invoiceNo} saved to database (synced = 0)`);
+    console.log(`Sale ${invoiceNo} saved to database (synced = 0)`);
 
     // ============================================
-    // 3. SAVE SALE ITEMS TO DATABASE
+    // 4. SAVE SALE ITEMS TO DATABASE
     // ============================================
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
@@ -155,21 +177,6 @@ router.post('/', async (req, res) => {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [saleId, i + 1, item.item_cd, item.item_name, item.item_cls_cd || '50101010', 
          item.quantity, item.price, item.tax_type, item.tax_amount || 0, item.total || 0]
-      );
-    }
-
-    // ============================================
-    // 4. UPDATE LOCAL STOCK
-    // ============================================
-    for (const item of items) {
-      await db.runAsync(
-        `UPDATE items SET stock = stock - ? WHERE item_cd = ?`,
-        [item.quantity, item.item_cd]
-      );
-      await db.runAsync(
-        `INSERT INTO stock_movements (item_cd, quantity, type, reference, date, created_at)
-         VALUES (?, ?, 'OUT', ?, ?, ?)`,
-        [item.item_cd, item.quantity, invoiceNo, date || now.slice(0, 10), now]
       );
     }
 
@@ -188,12 +195,28 @@ router.post('/', async (req, res) => {
       if (status.connected) {
         vscuResponse = await vscuClient.sendSale(vscuPayload);
         console.log('VSCU Response:', vscuResponse);
+        console.log('VSCU Response:', JSON.stringify(vscuResponse, null, 2));
         
         if (vscuResponse && (vscuResponse.resultCd === '000' || vscuResponse.resultCd === '00')) {
           synced = true;
           signature = vscuResponse.data?.rcptSign || '';
           receiptNo = vscuResponse.data?.rcptInvcNo || '';
-          console.log('✅ Sale approved by VSCU, signature received');
+          console.log('Sale approved by VSCU, signature received');
+          
+          // ============================================
+          // 5a. DEDUCT STOCK (ONLY AFTER VSCU APPROVAL)
+          // ============================================
+          for (const item of items) {
+            await db.runAsync(
+              `UPDATE items SET stock = stock - ? WHERE item_cd = ?`,
+              [item.quantity, item.item_cd]
+            );
+            await db.runAsync(
+              `INSERT INTO stock_movements (item_cd, quantity, type, reference, date, created_at)
+               VALUES (?, ?, 'OUT', ?, ?, ?)`,
+              [item.item_cd, item.quantity, invoiceNo, date || now.slice(0, 10), now]
+            );
+          }
         } else {
           // VSCU rejected - check if we should queue
           const errorMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'VSCU error';
@@ -291,11 +314,11 @@ router.post('/', async (req, res) => {
     }
 
     // ============================================
-    // 8. GET FINAL SALE DATA
-    // ============================================
-    const updatedSale = await db.getAsync(`SELECT * FROM sales WHERE id = ?`, [saleId]);
-    const updatedItems = await db.allAsync(`SELECT * FROM sales_items WHERE sale_id = ?`, [saleId]);
-    updatedSale.items = updatedItems;
+// 8. GET FINAL SALE DATA
+// ============================================
+const updatedSale = await db.getAsync(`SELECT * FROM sales WHERE id = ?`, [saleId]);
+const updatedItems = await db.allAsync(`SELECT * FROM sales_items WHERE sale_id = ?`, [saleId]);
+updatedSale.items = updatedItems;
 
     // ============================================
     // 9. RETURN RESPONSE

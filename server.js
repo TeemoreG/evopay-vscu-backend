@@ -5,6 +5,7 @@ const dotenv = require('dotenv');
 const axios = require('axios');
 dotenv.config();
 
+
 const salesRoutes = require('./routes/sales');
 const itemsRoutes = require('./routes/items');
 const stockRoutes = require('./routes/stock');
@@ -26,8 +27,8 @@ app.use(cors({
   origin: ['http://localhost:5173', 'http://localhost:3000'],
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use('/api/sales', salesRoutes);
 app.use('/api/items', itemsRoutes);
@@ -69,9 +70,9 @@ app.get('/api/vscu/status', async (req, res) => {
 // ============================================
 app.post('/api/initializer/selectInitInfo', async (req, res) => {
   try {
-    const vscuUrl = process.env.VSCU_URL || 'http://192.168.60.29:8090';
+    const vscuUrl = process.env.VSCU_URL || 'http://192.168.112.239:8090';
     
-    console.log('🔑 Initializing VSCU with:', {
+    console.log('Initializing VSCU with:', {
       url: `${vscuUrl}/initializer/selectInitInfo`,
       body: req.body
     });
@@ -85,25 +86,27 @@ app.post('/api/initializer/selectInitInfo', async (req, res) => {
           'tin': req.body.tin || process.env.TIN,
           'bhfId': req.body.bhfId || process.env.BHF_ID
         },
-        timeout: 10000 
+        timeout: 30000
       }
     );
     
-    console.log('✅ Init response:', response.data);
+    console.log('Init response:', response.data);
     res.json(response.data);
   } catch (error) {
-    console.error('❌ Init error:', error.message);
+    console.error('Init error:', error.message);
     
     let errorMessage = 'VSCU not reachable. Make sure it is running on port 8090.';
     let statusCode = 500;
     
     if (error.code === 'ECONNREFUSED') {
-      errorMessage = '❌ VSCU not reachable. Make sure it is running on port 8090.';
+      errorMessage = 'VSCU not reachable. Make sure it is running on port 8090.';
+    } else if (error.code === 'ECONNRESET' || error.message === 'socket hang up') {
+      errorMessage = 'VSCU crashed or closed the connection. Check the VSCU terminal for errors.';
     } else if (error.response) {
       errorMessage = error.response.data?.resultMsg || error.response.data?.message || 'VSCU returned an error';
       statusCode = error.response.status;
     } else if (error.request) {
-      errorMessage = '❌ No response from VSCU. Make sure it is running.';
+      errorMessage = 'No response from VSCU. Make sure it is running.';
     }
     
     res.status(statusCode).json({ 
@@ -115,14 +118,14 @@ app.post('/api/initializer/selectInitInfo', async (req, res) => {
 });
 
 // ============================================
-// AUTO-SYNC SCHEDULER
+// SYNC PROCESSING
 // ============================================
 const db = require('./db');
 const vscuClient = require('./services/vscuClient');
 
 let isAutoSyncing = false;
 
-async function processAutoSync() {
+async function processManualSync() {
   if (isAutoSyncing) return;
   isAutoSyncing = true;
 
@@ -130,19 +133,19 @@ async function processAutoSync() {
     const status = await vscuClient.checkStatus();
     if (!status.connected || !status.online) {
       isAutoSyncing = false;
-      return;
+      return { synced: 0, failed: 0, message: 'VSCU offline' };
     }
 
     const pending = await db.allAsync(
-      `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 20`
+      `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 50`
     );
 
     if (pending.length === 0) {
       isAutoSyncing = false;
-      return;
+      return { synced: 0, failed: 0, message: 'No pending items' };
     }
 
-    console.log(`🔄 Auto-sync: Processing ${pending.length} items...`);
+    console.log(`Manual sync: Processing ${pending.length} payloads...`);
 
     let synced = 0;
     let failed = 0;
@@ -178,6 +181,7 @@ async function processAutoSync() {
         if (response && (response.resultCd === '000' || response.resultCd === '00')) {
           await db.runAsync(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
           synced++;
+          console.log(`Synced item ${item.id} (${item.endpoint})`);
         } else {
           const errorMsg = response?.resultMsg || response?.message || 'Unknown error';
           await db.runAsync(
@@ -187,7 +191,7 @@ async function processAutoSync() {
           failed++;
         }
       } catch (itemError) {
-        console.error('Auto-sync item error:', itemError.message);
+        console.error('Manual sync item error:', itemError.message);
         await db.runAsync(
           `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
           [itemError.message, item.id]
@@ -196,59 +200,50 @@ async function processAutoSync() {
       }
     }
 
-    if (synced > 0 || failed > 0) {
-      console.log(`✅ Auto-sync: ${synced} synced, ${failed} failed, ${pending.length - synced - failed} remaining`);
-    }
+    console.log(`Manual sync: ${synced} synced, ${failed} failed`);
+
+    return { synced, failed, message: `Synced ${synced}, failed ${failed}` };
 
   } catch (error) {
-    console.error('Auto-sync error:', error.message);
+    console.error('Manual sync error:', error.message);
+    return { synced: 0, failed: 0, message: error.message };
   } finally {
     isAutoSyncing = false;
   }
 }
 
-function startAutoSync(intervalMs = 600000) {
-  console.log(`🔄 Auto-sync scheduler started (every ${intervalMs / 1000} seconds)`);
-
-  setTimeout(() => {
-    processAutoSync();
-  }, 10000);
-
-  const interval = setInterval(processAutoSync, intervalMs);
-  return interval;
-}
+app._manualSync = processManualSync;
 
 // ============================================
-// START SERVER
+// START SERVER WITH DATABASE CONNECTION
 // ============================================
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Backend running on http://localhost:${PORT}`);
-  console.log(`📡 API ready at http://localhost:${PORT}/api`);
-  
-  const syncInterval = startAutoSync();
-  global.__syncInterval = syncInterval;
-});
+const { connectDB } = require('./db');
 
-process.on('SIGTERM', () => {
-  console.log('Shutting down...');
-  if (global.__syncInterval) {
-    clearInterval(global.__syncInterval);
-  }
-  server.close(() => {
-    console.log('Server closed.');
-    process.exit(0);
+connectDB().then(() => {
+  const server = app.listen(PORT, () => {
+    console.log(`Backend running on http://localhost:${PORT}`);
+    console.log(`API ready at http://localhost:${PORT}/api`);
   });
-});
 
-process.on('SIGINT', () => {
-  console.log('Shutting down...');
-  if (global.__syncInterval) {
-    clearInterval(global.__syncInterval);
-  }
-  server.close(() => {
-    console.log('Server closed.');
-    process.exit(0);
+  process.on('SIGTERM', () => {
+    console.log('Shutting down...');
+    server.close(() => {
+      console.log('Server closed.');
+      process.exit(0);
+    });
   });
+
+  process.on('SIGINT', () => {
+    console.log('Shutting down...');
+    server.close(() => {
+      console.log('Server closed.');
+      process.exit(0);
+    });
+  });
+
+}).catch(err => {
+  console.error('Failed to connect to database:', err.message);
+  process.exit(1);
 });
 
 module.exports = app;

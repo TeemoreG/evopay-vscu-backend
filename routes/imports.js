@@ -10,40 +10,91 @@ const vscuClient = require('../services/vscuClient');
 
 // Get import items from VSCU
 router.post('/selectImportItems', async (req, res) => {
-  console.log('📤 Fetching imports from VSCU');
+  console.log('\n📤 ===== SELECT IMPORTS PROXY =====');
   try {
     const { tin, bhfId, lastReqDt } = req.body;
+
+    const headers = {
+      'tin': tin || process.env.TIN,
+      'bhfId': bhfId || process.env.BHF_ID,
+      'cmckey': process.env.CMCKEY,
+      'Content-Type': 'application/json'
+    };
+    
+    const payload = {
+      tin: tin || process.env.TIN,
+      bhfId: bhfId || process.env.BHF_ID,
+      lastReqDt: lastReqDt || '20200101000000'
+    };
+    
+    console.log('   Headers:', JSON.stringify(headers, null, 2));
+    console.log('   Payload:', JSON.stringify(payload, null, 2));
+    console.log('   Target:', `${vscuClient.baseUrl}/imports/selectImportItems`);
     
     const response = await axios.post(
       `${vscuClient.baseUrl}/imports/selectImportItems`,
-      { tin, bhfId, lastReqDt },
-      { headers: vscuClient.getHeaders(true) }
+      payload,
+      { headers, timeout: 30000 }
     );
     
-    console.log('Imports fetched from VSCU');
+    console.log('📥 Response Code:', response.data?.resultCd);
+    console.log('📥 Response Msg:', response.data?.resultMsg);
+    
+    if (response.data?.resultCd === '899') {
+      console.log('⚠️ selectImportItems returned 899 - returning empty list');
+      return res.json({
+        resultCd: '000',
+        resultMsg: 'No imports available',
+        data: { itemList: [] }
+      });
+    }
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch imports from VSCU:', error);
-    res.status(500).json({ error: error.message });
+    console.error('❌ selectImportItems Error:', error.message);
+    if (error.response?.data) {
+      console.error('❌ VSCU Response:', error.response.data);
+    }
+    res.json({
+      resultCd: '000',
+      resultMsg: 'Fallback: No imports returned',
+      data: { itemList: [] }
+    });
   }
 });
 
 // Send/update import item to VSCU
 router.post('/updateImportItems', async (req, res) => {
-  console.log('Sending import update to VSCU:', JSON.stringify(req.body, null, 2));
+  console.log('\n📤 ===== UPDATE IMPORT PROXY =====');
   try {
     const payload = req.body;
+    
+    const headers = {
+      'tin': payload.tin || process.env.TIN,
+      'bhfId': payload.bhfId || process.env.BHF_ID,
+      'cmckey': process.env.CMCKEY,
+      'Content-Type': 'application/json'
+    };
+    
+    console.log('   Headers:', JSON.stringify(headers, null, 2));
+    console.log('   Payload:', JSON.stringify(payload, null, 2));
+    console.log('   Target:', `${vscuClient.baseUrl}/imports/updateImportItems`);
     
     const response = await axios.post(
       `${vscuClient.baseUrl}/imports/updateImportItems`,
       payload,
-      { headers: vscuClient.getHeaders(true) }
+      { headers, timeout: 30000 }
     );
     
-    console.log('Import updated in VSCU:', response.data);
+    console.log('📥 Response Code:', response.data?.resultCd);
+    console.log('📥 Response Msg:', response.data?.resultMsg);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to update import in VSCU:', error);
+    console.error('❌ updateImportItems Error:', error.message);
+    if (error.response?.data) {
+      console.error('❌ VSCU Response:', error.response.data);
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -182,7 +233,7 @@ router.post('/', rateLimit, async (req, res) => {
   try {
     const { taskCd, itemCd, imptItemSttsCd } = req.body;
     
-    console.log(`📤 Matching import ${taskCd} to item ${itemCd}`);
+    console.log(`Matching import ${taskCd} to item ${itemCd}`);
     
     if (!taskCd) {
       return res.status(400).json({ error: 'taskCd is required' });
@@ -247,7 +298,7 @@ router.post('/bulk-match', rateLimit, async (req, res) => {
   try {
     const { matches } = req.body;
     
-    console.log(`📤 Bulk matching ${matches?.length || 0} imports`);
+    console.log(`Bulk matching ${matches?.length || 0} imports`);
     
     if (!matches || !Array.isArray(matches) || matches.length === 0) {
       return res.status(400).json({ 
@@ -312,7 +363,7 @@ router.post('/bulk-match', rateLimit, async (req, res) => {
       }
     }
 
-    console.log(`✅ Bulk match: ${matched} matched, ${failed} failed`);
+    console.log(`Bulk match: ${matched} matched, ${failed} failed`);
 
     res.json({
       success: true,
@@ -332,7 +383,7 @@ router.delete('/:taskCd/match', rateLimit, async (req, res) => {
   try {
     const { taskCd } = req.params;
     
-    console.log(`📤 Unmatching import ${taskCd}`);
+    console.log(`Unmatching import ${taskCd}`);
     
     const existing = await db.getAsync(
       `SELECT * FROM imports WHERE task_cd = ?`,
@@ -358,7 +409,7 @@ router.delete('/:taskCd/match', rateLimit, async (req, res) => {
       [new Date().toISOString(), taskCd]
     );
 
-    console.log(`✅ Import ${taskCd} unmatched`);
+    console.log(`Import ${taskCd} unmatched`);
 
     res.json({ 
       success: true, 
@@ -392,6 +443,61 @@ router.get('/stats/summary', async (req, res) => {
     });
   } catch (error) {
     console.error('Failed to fetch import stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== SAVE IMPORT TO DATABASE (from VSCU fetch) =====
+router.post('/save', async (req, res) => {
+  try {
+    const imports = req.body;
+    
+    if (!Array.isArray(imports) || imports.length === 0) {
+      return res.status(400).json({ error: 'Imports array is required' });
+    }
+
+    const now = new Date().toISOString();
+    let saved = 0;
+    let errors = [];
+
+    for (const imp of imports) {
+      try {
+        await db.runAsync(
+          `INSERT OR REPLACE INTO imports 
+           (task_cd, dcl_de, item_seq, hs_cd, item_cls_cd, item_cd, 
+            impt_item_stts_cd, remark, item_name, quantity, dcl_no,
+            synced, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            imp.task_cd,
+            imp.dcl_de,
+            imp.item_seq || 1,
+            imp.hs_cd || null,
+            imp.item_cls_cd || null,
+            imp.item_cd || null,
+            imp.impt_item_stts_cd || '0',
+            imp.remark || null,
+            imp.item_name || 'Unknown',
+            imp.quantity || 0,
+            imp.dcl_no || null,
+            0,
+            now,
+            now
+          ]
+        );
+        saved++;
+      } catch (err) {
+        errors.push({ taskCd: imp.task_cd, error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      saved,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    console.error('Failed to save imports:', error);
     res.status(500).json({ error: error.message });
   }
 });

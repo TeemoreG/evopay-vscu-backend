@@ -10,6 +10,7 @@ const axios = require('axios');
 // POST /stock/selectStockItems
 // ============================================
 router.post('/selectStockItems', async (req, res) => {
+  console.log('Fetching stock from VSCU:', req.body);
   try {
     const { tin, bhfId, lastReqDt } = req.body;
     
@@ -19,9 +20,17 @@ router.post('/selectStockItems', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('VSCU Response Code:', response.data?.resultCd);
+    console.log('VSCU Response Msg:', response.data?.resultMsg);
+    console.log('Stock list length:', response.data?.data?.stockList?.length || 0);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to fetch stock from VSCU:', error);
+    console.error('Failed to fetch stock from VSCU:', error.message);
+    if (error.response) {
+      console.error('VSCU Error Status:', error.response.status);
+      console.error('VSCU Error Data:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -31,6 +40,7 @@ router.post('/selectStockItems', async (req, res) => {
 // POST /stock/saveStockItems
 // ============================================
 router.post('/saveStockItems', async (req, res) => {
+  console.log('Sending stock to VSCU');
   try {
     const payload = req.body;
     
@@ -40,9 +50,16 @@ router.post('/saveStockItems', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('VSCU Response Code:', response.data?.resultCd);
+    console.log('VSCU Response Msg:', response.data?.resultMsg);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to send stock to VSCU:', error);
+    console.error('Failed to send stock to VSCU:', error.message);
+    if (error.response) {
+      console.error('VSCU Error Status:', error.response.status);
+      console.error('VSCU Error Data:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -52,6 +69,7 @@ router.post('/saveStockItems', async (req, res) => {
 // POST /stockMaster/saveStockMaster
 // ============================================
 router.post('/stockMaster/saveStockMaster', async (req, res) => {
+  console.log('Saving stock master:', req.body.itemCd);
   try {
     const { tin, bhfId, itemCd, rsdQty, regrId, regrNm, modrNm, modrId } = req.body;
     
@@ -61,9 +79,69 @@ router.post('/stockMaster/saveStockMaster', async (req, res) => {
       { headers: vscuClient.getHeaders(true) }
     );
     
+    console.log('VSCU Response Code:', response.data?.resultCd);
+    console.log('VSCU Response Msg:', response.data?.resultMsg);
+    
     res.json(response.data);
   } catch (error) {
-    console.error('Failed to save stock master:', error);
+    console.error('Failed to save stock master:', error.message);
+    if (error.response) {
+      console.error('VSCU Error Status:', error.response.status);
+      console.error('VSCU Error Data:', JSON.stringify(error.response.data, null, 2));
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 4. BULK SAVE STOCK (from VSCU)
+// POST /stock/bulk
+// ============================================
+router.post('/bulk', async (req, res) => {
+  try {
+    const stockList = req.body;
+    
+    if (!Array.isArray(stockList) || stockList.length === 0) {
+      return res.status(400).json({ error: 'Stock array is required' });
+    }
+
+    const now = new Date().toISOString();
+    let saved = 0;
+
+    for (const stock of stockList) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO items (
+          item_cd, item_name, item_std_nm, item_cls_cd, item_ty_cd, 
+          price, tax_type, stock, sfty_qty, orgn_nat_cd, pkg_unit_cd, qty_unit_cd,
+          use_yn, isrc_aplcb_yn, bcd, add_info, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          stock.itemCd || stock.item_cd,
+          stock.itemNm || stock.item_name || 'Unknown',
+          stock.itemStdNm || stock.item_std_nm || null,
+          stock.itemClsCd || stock.item_cls_cd || '50101010',
+          stock.itemTyCd || stock.item_ty_cd || '1',
+          stock.dftPrc || stock.price || 0,
+          stock.taxTyCd || stock.tax_type || 'B',
+          stock.stock || 0,
+          stock.sftyQty || stock.sfty_qty || 5,
+          stock.orgnNatCd || stock.orgn_nat_cd || 'KE',
+          stock.pkgUnitCd || stock.pkg_unit_cd || 'NT',
+          stock.qtyUnitCd || stock.qty_unit_cd || 'U',
+          stock.useYn || stock.use_yn || 'Y',
+          stock.isrcAplcbYn || stock.isrc_aplcb_yn || 'N',
+          stock.bcd || null,
+          stock.addInfo || stock.add_info || null,
+          now
+        ]
+      );
+      saved++;
+    }
+
+    console.log(`Bulk saved ${saved} stock items from VSCU`);
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Bulk save stock error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -74,35 +152,57 @@ router.post('/stockMaster/saveStockMaster', async (req, res) => {
 
 // Get all stock (local)
 router.get('/', async (req, res) => {
+  console.log('\n[STOCK] GET ALL');
+  console.log('[STOCK] Timestamp:', new Date().toISOString());
   try {
     const rows = await db.allAsync(
       `SELECT * FROM items WHERE use_yn = 'Y' ORDER BY item_name`
     );
+    console.log(`[STOCK] Fetched ${rows.length} stock items from database`);
     res.json(rows);
   } catch (error) {
-    console.error('Failed to fetch stock:', error);
+    console.error('[STOCK] ERROR:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
 // Record stock movement (local + VSCU)
 router.post('/movement', async (req, res) => {
+  console.log('\n[STOCK] MOVEMENT');
+  console.log('[STOCK] Item:', req.body.itemCd);
+  console.log('[STOCK] Qty:', req.body.qty);
+  console.log('[STOCK] Type:', req.body.type);
   try {
     const { itemCd, qty, type, reason, reference, cashier } = req.body;
     const now = new Date().toISOString();
 
     if (!itemCd || !qty || !type) {
+      console.log('[STOCK] ERROR: Missing required fields');
       return res.status(400).json({ error: 'itemCd, qty, and type are required' });
     }
 
     const item = await db.getAsync(`SELECT * FROM items WHERE item_cd = ?`, [itemCd]);
     if (!item) {
+      console.log(`[STOCK] ERROR: Item ${itemCd} not found`);
       return res.status(404).json({ error: 'Item not found' });
     }
 
+    console.log(`[STOCK] Current stock: ${item.stock}`);
+
+    // VALIDATE FIRST
+    if (type === 'OUT' && item.stock < qty) {
+      console.log(`[STOCK] ERROR: Insufficient stock. Available: ${item.stock}, Requested: ${qty}`);
+      return res.status(400).json({ 
+        error: `Not enough stock! Available: ${item.stock}, Requested: ${qty}` 
+      });
+    }
+
+    // THEN calculate
     const delta = type === 'IN' ? qty : -qty;
-    const newStock = Math.max(0, item.stock + delta);
+    const newStock = item.stock + delta;
     const qtyAbs = Math.abs(qty);
+
+    console.log(`[STOCK] New stock will be: ${newStock}`);
 
     // ============================================
     // 1. BUILD STOCK PAYLOAD
@@ -181,7 +281,7 @@ router.post('/movement', async (req, res) => {
         
         if (vscuResponse && (vscuResponse.resultCd === '000' || vscuResponse.resultCd === '00')) {
           synced = true;
-          console.log(`✅ Stock movement for ${itemCd} synced to VSCU`);
+          console.log(`Stock movement for ${itemCd} synced to VSCU`);
         } else {
           const errorMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'VSCU error';
           console.log(`VSCU returned ${vscuResponse?.resultCd || 'unknown'} - queuing stock movement`);
@@ -297,6 +397,7 @@ router.get('/:itemCd/movements', async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
+    console.error('Failed to fetch stock movements:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -309,6 +410,7 @@ router.get('/alerts/low', async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
+    console.error('Failed to fetch low stock alerts:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
