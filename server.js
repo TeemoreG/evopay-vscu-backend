@@ -27,7 +27,7 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://teemoreg.github.io',
-  'https://evopay-vscu-frontend.vercel.app',
+  'https://evopay-vscu-backend.onrender.com',
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
