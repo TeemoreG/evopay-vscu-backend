@@ -1,0 +1,16 @@
+
+db/evopay.db
+
+db/*.db
+
+db/*.db-journal
+
+logs/
+
+logdy.exe*
+
+backend.rar
+
+.env
+
+node_modules/
