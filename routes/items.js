@@ -37,12 +37,11 @@ router.post('/selectItems', async (req, res) => {
       { headers, timeout: 30000 }
     );
     
-    console.log('📥 Response Code:', response.data?.resultCd);
-    console.log('📥 Response Msg:', response.data?.resultMsg);
+    console.log('Response Code:', response.data?.resultCd);
+    console.log('Response Msg:', response.data?.resultMsg);
     
-    // If 899, return empty list gracefully
     if (response.data?.resultCd === '899') {
-      console.log('⚠️ selectItems returned 899 - returning empty list');
+      console.log('selectItems returned 899 - returning empty list');
       return res.json({
         resultCd: '000',
         resultMsg: 'No items available',
@@ -56,7 +55,6 @@ router.post('/selectItems', async (req, res) => {
     if (error.response?.data) {
       console.error('❌ VSCU Response:', error.response.data);
     }
-    // Return empty list on error (graceful fallback)
     res.json({
       resultCd: '000',
       resultMsg: 'Fallback: No items returned',
@@ -115,7 +113,6 @@ router.post('/saveItemComposition', async (req, res) => {
   try {
     const payload = req.body;
     
-    // FIX: Force tin from env if empty
     if (!payload.tin || payload.tin === '') {
       payload.tin = process.env.TIN;
     }
@@ -530,13 +527,41 @@ router.post('/', async (req, res) => {
 
     // ============================================
     // 1. SAVE TO DATABASE FIRST (ALWAYS)
+    // Preserve existing stock/created_at when updating
+    // (sync confirmations send no stock field)
     // ============================================
+    const existing = await db.getAsync(
+      `SELECT stock, created_at FROM items WHERE item_cd = ?`,
+      [itemCode]
+    );
+    const stockToUse = existing ? existing.stock : Number(item.stock || 0);
+    const createdAt = existing?.created_at || now;
+
     await db.runAsync(
-      `INSERT OR REPLACE INTO items 
+      `INSERT INTO items 
        (item_cd, item_name, item_std_nm, item_cls_cd, item_ty_cd, price, tax_type, stock, sfty_qty,
         orgn_nat_cd, pkg_unit_cd, qty_unit_cd, use_yn, isrc_aplcb_yn, btch_no, bcd, add_info,
         synced, sync_error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+       ON CONFLICT(item_cd) DO UPDATE SET
+         item_name = excluded.item_name,
+         item_std_nm = excluded.item_std_nm,
+         item_cls_cd = excluded.item_cls_cd,
+         item_ty_cd = excluded.item_ty_cd,
+         price = excluded.price,
+         tax_type = excluded.tax_type,
+         sfty_qty = excluded.sfty_qty,
+         orgn_nat_cd = excluded.orgn_nat_cd,
+         pkg_unit_cd = excluded.pkg_unit_cd,
+         qty_unit_cd = excluded.qty_unit_cd,
+         use_yn = excluded.use_yn,
+         isrc_aplcb_yn = excluded.isrc_aplcb_yn,
+         btch_no = excluded.btch_no,
+         bcd = excluded.bcd,
+         add_info = excluded.add_info,
+         synced = 0,
+         sync_error = excluded.sync_error,
+         updated_at = excluded.updated_at`,
       [
         item.itemCd || item.item_cd,
         item.itemNm || item.item_name,
@@ -545,7 +570,7 @@ router.post('/', async (req, res) => {
         item.itemTyCd || item.item_ty_cd || '1',
         Number(item.dftPrc || item.price || 0),
         item.taxTyCd || item.tax_type || 'B',
-        Number(item.stock || 0),
+        stockToUse,
         Number(item.sftyQty || item.sfty_qty || 5),
         item.orgnNatCd || item.orgn_nat_cd || 'KE',
         item.pkgUnitCd || item.pkg_unit_cd || 'NT',
@@ -555,8 +580,8 @@ router.post('/', async (req, res) => {
         item.btchNo || item.btch_no || null,
         item.bcd || null,
         item.addInfo || item.add_info || null,
-        null,  // sync_error (default null)
-        now,
+        null,
+        createdAt,
         now
       ]
     );
@@ -584,7 +609,6 @@ router.post('/', async (req, res) => {
         const resCd = vscuResponse?.resultCd;
 
         if (resCd === '000' || resCd === '00') {
-          // VSCU Success - update database
           await db.runAsync(
             `UPDATE items SET synced = 1, sync_error = NULL, updated_at = ? WHERE item_cd = ?`,
             [now, itemCode]
@@ -592,7 +616,6 @@ router.post('/', async (req, res) => {
           synced = true;
           console.log(`✅ Item ${itemCode} synced to VSCU`);
         } else {
-          // VSCU rejected - DO NOT QUEUE (broken payload)
           const errMsg = vscuResponse?.resultMsg || vscuResponse?.message || 'Validation Error';
           console.error(`❌ VSCU Error - Item ${itemCode} [Code ${resCd}]: ${errMsg}`);
           
@@ -602,7 +625,6 @@ router.post('/', async (req, res) => {
           );
         }
       } else {
-        // VSCU offline - QUEUE for later
         console.log('⏳ VSCU offline - queuing item for later');
         await db.runAsync(
           `INSERT INTO sync_queue (endpoint, payload, error_reason, created_at) VALUES (?, ?, ?, ?)`,
@@ -612,7 +634,6 @@ router.post('/', async (req, res) => {
         console.log(`⏳ Item ${itemCode} queued for VSCU sync (VSCU offline)`);
       }
     } catch (vscuError) {
-      // Network/Timeout - QUEUE for later
       console.error('❌ VSCU Network error:', vscuError.message);
       if (vscuError.code === 'ECONNABORTED') {
         console.error('⏰ Request timed out');
@@ -652,13 +673,11 @@ router.delete('/:itemCd', async (req, res) => {
 
     const now = new Date().toISOString();
     
-    // Remove any existing sync_queue entries for this item (prevent duplicate queue)
     await db.runAsync(
       `DELETE FROM sync_queue WHERE endpoint = '/items/saveItems' AND json_extract(payload, '$.itemCd') = ?`,
       [req.params.itemCd]
     );
 
-    // Queue deletion to VSCU
     const vscuPayload = {
       tin: process.env.TIN,
       bhfId: process.env.BHF_ID,
@@ -706,15 +725,14 @@ router.patch('/:itemCd/stock', async (req, res) => {
       return res.status(404).json({ error: 'Item not found' });
     }
 
-    // Validate stock before calculating
-if (type === 'OUT' && item.stock < quantity) {
-  toast.error(`Not enough stock! Available: ${item.stock}, Requested: ${quantity}`);
-  return; // Stop execution
-}
+    if (type === 'OUT' && item.stock < quantity) {
+      return res.status(400).json({
+        error: `Not enough stock! Available: ${item.stock}, Requested: ${quantity}`
+      });
+    }
 
-// Then calculate 
-const delta = type === 'IN' ? quantity : -quantity;
-const newStock = item.stock + delta;
+    const delta = type === 'IN' ? quantity : -quantity;
+    const newStock = item.stock + delta;
 
     await db.runAsync(
       `UPDATE items SET stock = ?, updated_at = ? WHERE item_cd = ?`,
@@ -771,7 +789,7 @@ router.get('/tax/:taxType', async (req, res) => {
   }
 });
 
-// Bulk import items
+// Bulk import items (preserves existing stock on update)
 router.post('/bulk', async (req, res) => {
   try {
     const items = req.body;
@@ -787,22 +805,40 @@ router.post('/bulk', async (req, res) => {
           continue;
         }
 
+        const existingBulk = await db.getAsync(
+          `SELECT stock, created_at FROM items WHERE item_cd = ?`,
+          [item.itemCd]
+        );
+        const bulkStock = existingBulk ? existingBulk.stock : Number(item.stock || 0);
+        const bulkCreatedAt = existingBulk?.created_at || now;
+
         await db.runAsync(
-          `INSERT OR REPLACE INTO items 
+          `INSERT INTO items 
            (item_cd, item_name, item_cls_cd, price, tax_type, stock, orgn_nat_cd, pkg_unit_cd, qty_unit_cd, use_yn, synced, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(item_cd) DO UPDATE SET
+             item_name = excluded.item_name,
+             item_cls_cd = excluded.item_cls_cd,
+             price = excluded.price,
+             tax_type = excluded.tax_type,
+             orgn_nat_cd = excluded.orgn_nat_cd,
+             pkg_unit_cd = excluded.pkg_unit_cd,
+             qty_unit_cd = excluded.qty_unit_cd,
+             use_yn = excluded.use_yn,
+             synced = 0,
+             updated_at = excluded.updated_at`,
           [
             item.itemCd,
             item.itemNm,
             item.itemClsCd || '50101010',
             Number(item.dftPrc || item.price || 0),
             item.taxTyCd || 'B',
-            Number(item.stock || 0),
+            bulkStock,
             item.orgnNatCd || 'KE',
             item.pkgUnitCd || 'NT',
             item.qtyUnitCd || 'U',
             item.useYn || 'Y',
-            now,
+            bulkCreatedAt,
             now
           ]
         );
