@@ -7,7 +7,7 @@ console.log('CMCKEY loaded:', process.env.CMCKEY ? 'YES' : 'NO');
 console.log('CMCKEY value:', process.env.CMCKEY);
 console.log('TIN loaded:', process.env.TIN);
 
-const VSCU_URL = process.env.VSCU_URL || 'http://192.168.112.239:8090';
+const VSCU_URL = process.env.VSCU_URL || '';
 const TIN = process.env.TIN;
 const BHF_ID = process.env.BHF_ID;
 const CMCKEY = process.env.CMCKEY;
