@@ -1,9 +1,39 @@
-// backend/server.js
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const axios = require('axios');
 dotenv.config();
+
+// ============================================
+// LOGGER HELPERS
+// ============================================
+const colors = {
+  reset: '\x1b[0m',
+  gray: '\x1b[90m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  bold: '\x1b[1m',
+};
+
+const log = {
+  info: (msg) => console.log(`${colors.cyan}[INFO]${colors.reset} ${msg}`),
+  ok: (msg) => console.log(`${colors.green}[ OK ]${colors.reset} ${msg}`),
+  warn: (msg) => console.log(`${colors.yellow}[WARN]${colors.reset} ${msg}`),
+  err: (msg) => console.log(`${colors.red}[FAIL]${colors.reset} ${msg}`),
+  req: (method, path, extra = '') =>
+    console.log(`${colors.magenta}[REQ ]${colors.reset} ${method.padEnd(6)} ${path} ${colors.gray}${extra}${colors.reset}`),
+  res: (status, method, path, ms, extra = '') => {
+    const color = status >= 500 ? colors.red : status >= 400 ? colors.yellow : colors.green;
+    console.log(`${color}[RES ]${colors.reset} ${String(status).padEnd(4)} ${method.padEnd(6)} ${path} ${colors.gray}(${ms}ms)${colors.reset} ${extra}`);
+  },
+  vscu: (msg) => console.log(`${colors.blue}[VSCU]${colors.reset} ${msg}`),
+  db: (msg) => console.log(`${colors.green}[ DB ]${colors.reset} ${msg}`),
+  line: () => console.log(`${colors.gray}${'─'.repeat(70)}${colors.reset}`),
+};
 
 const salesRoutes = require('./routes/sales');
 const itemsRoutes = require('./routes/items');
@@ -22,22 +52,65 @@ const suppliersRoutes = require('./routes/suppliers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS - Allow both local and production
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'https://teemoreg.github.io',
-  'https://evopay-vscu-backend.onrender.com',
-  process.env.FRONTEND_URL
-].filter(Boolean);
-
 app.use(cors({
-  origin: allowedOrigins,
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://192.168.112.120:5173',
+    'http://192.168.60.29:3000'
+  ],
   credentials: true,
 }));
-
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// ============================================
+// REQUEST LOGGER MIDDLEWARE
+// ============================================
+const QUIET_PATHS = ['/api/health', '/api/vscu/status'];
+const isQuiet = (p) => QUIET_PATHS.some((q) => p === q || p.startsWith(q));
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const quiet = isQuiet(req.path);
+
+  if (!quiet) {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '-';
+    log.req(req.method, req.originalUrl, `from ${ip}`);
+
+    if (req.method !== 'GET' && req.body && Object.keys(req.body).length) {
+      const body = JSON.stringify(req.body);
+      const preview = body.length > 200 ? body.slice(0, 200) + '...' : body;
+      console.log(`${colors.gray}       ${preview}${colors.reset}`);
+    }
+  }
+
+  const origJson = res.json.bind(res);
+  res.json = (payload) => {
+    if (!quiet) {
+      const ms = Date.now() - start;
+      let summary = '';
+      if (payload && typeof payload === 'object') {
+        if (Array.isArray(payload)) {
+          summary = `${payload.length} item(s)`;
+        } else if (payload.error) {
+          summary = `${colors.red}${payload.error}${colors.reset}`;
+        } else if (payload.resultCd) {
+          summary = `resultCd=${payload.resultCd}`;
+        } else if (payload.synced !== undefined) {
+          summary = `synced=${payload.synced} failed=${payload.failed || 0}`;
+        } else {
+          const str = JSON.stringify(payload);
+          summary = str.length > 120 ? str.slice(0, 120) + '...' : str;
+        }
+      }
+      log.res(res.statusCode, req.method, req.originalUrl, ms, summary);
+    }
+    return origJson(payload);
+  };
+
+  next();
+});
 
 app.use('/api/sales', salesRoutes);
 app.use('/api/items', itemsRoutes);
@@ -54,12 +127,10 @@ app.use('/api/customers', customersRoutes);
 app.use('/api/suppliers', suppliersRoutes);
 
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    database: process.env.NODE_ENV === 'production' ? 'Supabase' : 'SQLite'
   });
 });
 
@@ -82,17 +153,14 @@ app.get('/api/vscu/status', async (req, res) => {
 app.post('/api/initializer/selectInitInfo', async (req, res) => {
   try {
     const vscuUrl = process.env.VSCU_URL || 'http://192.168.112.239:8090';
-    
-    console.log('Initializing VSCU with:', {
-      url: `${vscuUrl}/initializer/selectInitInfo`,
-      body: req.body
-    });
+
+    log.vscu(`Initializing device → ${vscuUrl}/initializer/selectInitInfo`);
 
     const response = await axios.post(
       `${vscuUrl}/initializer/selectInitInfo`,
       req.body,
-      { 
-        headers: { 
+      {
+        headers: {
           'Content-Type': 'application/json',
           'tin': req.body.tin || process.env.TIN,
           'bhfId': req.body.bhfId || process.env.BHF_ID
@@ -100,15 +168,15 @@ app.post('/api/initializer/selectInitInfo', async (req, res) => {
         timeout: 30000
       }
     );
-    
-    console.log('Init response:', response.data);
+
+    log.vscu(`Init OK → resultCd=${response.data?.resultCd}`);
     res.json(response.data);
   } catch (error) {
-    console.error('Init error:', error.message);
-    
+    log.err(`Init error: ${error.message}`);
+
     let errorMessage = 'VSCU not reachable. Make sure it is running on port 8090.';
     let statusCode = 500;
-    
+
     if (error.code === 'ECONNREFUSED') {
       errorMessage = 'VSCU not reachable. Make sure it is running on port 8090.';
     } else if (error.code === 'ECONNRESET' || error.message === 'socket hang up') {
@@ -119,8 +187,8 @@ app.post('/api/initializer/selectInitInfo', async (req, res) => {
     } else if (error.request) {
       errorMessage = 'No response from VSCU. Make sure it is running.';
     }
-    
-    res.status(statusCode).json({ 
+
+    res.status(statusCode).json({
       error: errorMessage,
       details: error.message,
       resultCd: error.response?.data?.resultCd || '999'
@@ -131,11 +199,10 @@ app.post('/api/initializer/selectInitInfo', async (req, res) => {
 // ============================================
 // SYNC PROCESSING
 // ============================================
-const { connectDB, query, run } = require('./db');
+const db = require('./db');
 const vscuClient = require('./services/vscuClient');
 
 let isAutoSyncing = false;
-let db;
 
 async function processManualSync() {
   if (isAutoSyncing) return;
@@ -148,8 +215,7 @@ async function processManualSync() {
       return { synced: 0, failed: 0, message: 'VSCU offline' };
     }
 
-    // Use query() instead of db.allAsync
-    const pending = await query(
+    const pending = await db.allAsync(
       `SELECT * FROM sync_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 50`
     );
 
@@ -158,7 +224,8 @@ async function processManualSync() {
       return { synced: 0, failed: 0, message: 'No pending items' };
     }
 
-    console.log(`Manual sync: Processing ${pending.length} payloads...`);
+    log.info(`Manual sync: ${pending.length} payload(s) queued`);
+    log.line();
 
     let synced = 0;
     let failed = 0;
@@ -183,29 +250,31 @@ async function processManualSync() {
         } else if (item.endpoint === '/branches/saveBrancheUsers') {
           response = await vscuClient.saveBranchUser(payload);
         } else {
-          await run(
+          await db.runAsync(
             `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
             ['Unknown endpoint: ' + item.endpoint, item.id]
           );
+          log.err(`Unknown endpoint: ${item.endpoint}`);
           failed++;
           continue;
         }
 
         if (response && (response.resultCd === '000' || response.resultCd === '00')) {
-          await run(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
+          await db.runAsync(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
+          log.ok(`${item.endpoint} → ${payload.itemCd || payload.invcNo || item.id}`);
           synced++;
-          console.log(`Synced item ${item.id} (${item.endpoint})`);
         } else {
           const errorMsg = response?.resultMsg || response?.message || 'Unknown error';
-          await run(
+          await db.runAsync(
             `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
             [errorMsg, item.id]
           );
+          log.err(`${item.endpoint} → ${errorMsg}`);
           failed++;
         }
       } catch (itemError) {
-        console.error('Manual sync item error:', itemError.message);
-        await run(
+        log.err(`Sync item error: ${itemError.message}`);
+        await db.runAsync(
           `UPDATE sync_queue SET retry_count = retry_count + 1, error = ?, last_attempt = CURRENT_TIMESTAMP WHERE id = ?`,
           [itemError.message, item.id]
         );
@@ -213,11 +282,13 @@ async function processManualSync() {
       }
     }
 
-    console.log(`Manual sync: ${synced} synced, ${failed} failed`);
+    log.line();
+    log.info(`Manual sync done: ${synced} synced, ${failed} failed`);
+
     return { synced, failed, message: `Synced ${synced}, failed ${failed}` };
 
   } catch (error) {
-    console.error('Manual sync error:', error.message);
+    log.err(`Manual sync error: ${error.message}`);
     return { synced: 0, failed: 0, message: error.message };
   } finally {
     isAutoSyncing = false;
@@ -227,35 +298,61 @@ async function processManualSync() {
 app._manualSync = processManualSync;
 
 // ============================================
-// START SERVER WITH DATABASE CONNECTION
+// GLOBAL ERROR HANDLER
 // ============================================
-connectDB().then((dbInstance) => {
-  db = dbInstance;
+app.use((err, req, res, next) => {
+  log.err(`Unhandled: ${err.message}`);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal server error', message: err.message });
+});
+
+process.on('uncaughtException', (err) => {
+  log.err(`Uncaught exception: ${err.stack || err.message}`);
+});
+process.on('unhandledRejection', (reason) => {
+  log.err(`Unhandled rejection: ${reason instanceof Error ? reason.stack : reason}`);
+});
+
+// ============================================
+// START SERVER
+// ============================================
+const { connectDB } = require('./db');
+
+log.line();
+log.info(`${colors.bold}Evopay VSCU Backend${colors.reset}`);
+log.info(`Node ${process.version} · Port ${PORT}`);
+log.info(`VSCU target: ${process.env.VSCU_URL || 'not set'}`);
+log.line();
+
+connectDB().then(async () => {
+  log.db('Connected');
+
+  try {
+    const { initTablesOnce } = require('./routes/data');
+    await initTablesOnce();
+    log.db('Tables ready');
+  } catch (e) {
+    log.err(`Init tables failed: ${e.message}`);
+  }
+
   const server = app.listen(PORT, () => {
-    console.log(`Backend running on http://localhost:${PORT}`);
-    console.log(`API ready at http://localhost:${PORT}/api`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Database: ${process.env.NODE_ENV === 'production' ? 'Supabase' : 'SQLite'}`);
+    log.line();
+    log.ok(`${colors.bold}API ready → http://localhost:${PORT}/api${colors.reset}`);
+    log.line();
   });
 
   process.on('SIGTERM', () => {
-    console.log('Shutting down...');
-    server.close(() => {
-      console.log('Server closed.');
-      process.exit(0);
-    });
+    log.warn('SIGTERM — shutting down');
+    server.close(() => process.exit(0));
   });
 
   process.on('SIGINT', () => {
-    console.log('Shutting down...');
-    server.close(() => {
-      console.log('Server closed.');
-      process.exit(0);
-    });
+    log.warn('SIGINT — shutting down');
+    server.close(() => process.exit(0));
   });
 
 }).catch(err => {
-  console.error('Failed to connect to database:', err.message);
+  log.err(`DB connect failed: ${err.message}`);
   process.exit(1);
 });
 
